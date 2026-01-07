@@ -1,19 +1,27 @@
-//! Cursor state for WYSIWYG editing
+//! Cursor display state for WYSIWYG editing
 //!
-//! Encapsulates cursor position and visibility state,
-//! separated from the main Pager struct for cleaner organization.
+//! Encapsulates cursor visibility and visual override state,
+//! separated from position which is tracked by EditorState.
+//!
+//! # Position Source of Truth
+//!
+//! The cursor position is stored in `EditorState.cursor` - this module
+//! only tracks display concerns:
+//! - `visible`: For cursor blinking animation
+//! - `visual_override`: For special positioning (e.g., after Enter key)
 
-use crate::primitives::{ByteOffset, ScreenPos};
+use crate::primitives::ScreenPos;
 
-/// Cursor state for text editing
+/// Cursor display state for text editing
 ///
-/// Tracks the cursor position in source bytes and visibility state
-/// for blinking. Also handles visual overrides for special cases
-/// like positioning after Enter key.
+/// This struct handles display concerns only. The actual cursor position
+/// is managed by `EditorState`. Use `EditorState::cursor()` to get position.
+///
+/// Visual overrides are used for cases where the cursor should appear
+/// at a position that doesn't yet have corresponding source content
+/// (e.g., after pressing Enter before any text is typed).
 #[derive(Debug, Clone)]
 pub struct CursorState {
-    /// Current cursor position as source byte offset (None = no cursor)
-    position: Option<ByteOffset>,
     /// Whether cursor is currently visible (for blinking)
     visible: bool,
     /// Visual position override - used after Enter to position cursor
@@ -23,28 +31,12 @@ pub struct CursorState {
 }
 
 impl CursorState {
-    /// Create a new cursor state at the given position
-    pub fn new(position: Option<ByteOffset>) -> Self {
+    /// Create a new cursor display state
+    pub fn new() -> Self {
         Self {
-            position,
             visible: true,
             visual_override: None,
         }
-    }
-
-    /// Get the current cursor position
-    pub fn position(&self) -> Option<ByteOffset> {
-        self.position
-    }
-
-    /// Set the cursor position
-    pub fn set_position(&mut self, position: ByteOffset) {
-        self.position = Some(position);
-    }
-
-    /// Set the cursor position (optional variant)
-    pub fn set_position_opt(&mut self, position: Option<ByteOffset>) {
-        self.position = position;
     }
 
     /// Check if cursor is visible (for blinking)
@@ -67,11 +59,6 @@ impl CursorState {
         self.visual_override = Some(ScreenPos::new(line, col));
     }
 
-    /// Set a visual position override from a ScreenPos
-    pub fn set_visual_override_pos(&mut self, pos: ScreenPos) {
-        self.visual_override = Some(pos);
-    }
-
     /// Clear the visual override
     pub fn clear_visual_override(&mut self) {
         self.visual_override = None;
@@ -85,7 +72,7 @@ impl CursorState {
 
 impl Default for CursorState {
     fn default() -> Self {
-        Self::new(None)
+        Self::new()
     }
 }
 
@@ -99,28 +86,14 @@ mod tests {
 
     #[test]
     fn test_new_cursor_state() {
-        let cursor = CursorState::new(Some(ByteOffset(10)));
-        assert_eq!(cursor.position(), Some(ByteOffset(10)));
+        let cursor = CursorState::new();
         assert!(cursor.is_visible());
         assert!(cursor.visual_override().is_none());
     }
 
     #[test]
-    fn test_new_cursor_state_none() {
-        let cursor = CursorState::new(None);
-        assert_eq!(cursor.position(), None);
-    }
-
-    #[test]
-    fn test_set_position() {
-        let mut cursor = CursorState::new(None);
-        cursor.set_position(ByteOffset(42));
-        assert_eq!(cursor.position(), Some(ByteOffset(42)));
-    }
-
-    #[test]
     fn test_toggle_visibility() {
-        let mut cursor = CursorState::new(None);
+        let mut cursor = CursorState::new();
         assert!(cursor.is_visible());
 
         cursor.toggle_visibility();
@@ -132,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_visual_override() {
-        let mut cursor = CursorState::new(None);
+        let mut cursor = CursorState::new();
         assert!(!cursor.has_visual_override());
         assert!(cursor.visual_override().is_none());
 
@@ -148,7 +121,7 @@ mod tests {
     #[test]
     fn test_default() {
         let cursor = CursorState::default();
-        assert_eq!(cursor.position(), None);
         assert!(cursor.is_visible());
+        assert!(!cursor.has_visual_override());
     }
 }
