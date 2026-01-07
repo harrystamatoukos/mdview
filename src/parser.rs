@@ -361,6 +361,7 @@ where
                 let mut spans = Vec::new();
                 let mut nested = None;
                 let mut item_end = item_range.end;
+                let mut emphasis_level = 0u8; // Track bold/italic state
 
                 loop {
                     match iter.next() {
@@ -369,8 +370,15 @@ where
                             break;
                         }
                         Some((Event::Text(t), range)) => {
+                            let text = t.into_string();
+                            let kind = match emphasis_level {
+                                0 => SpanKind::Text(text),
+                                1 => SpanKind::Emphasis(text),
+                                2 => SpanKind::Strong(text),
+                                _ => SpanKind::StrongEmphasis(text),
+                            };
                             spans.push(Span {
-                                kind: SpanKind::Text(t.into_string()),
+                                kind,
                                 source: SourceSpan::from_range(range),
                             });
                         }
@@ -380,10 +388,10 @@ where
                                 source: SourceSpan::from_range(range),
                             });
                         }
-                        Some((Event::Start(Tag::Emphasis), _)) => {}
-                        Some((Event::End(TagEnd::Emphasis), _)) => {}
-                        Some((Event::Start(Tag::Strong), _)) => {}
-                        Some((Event::End(TagEnd::Strong), _)) => {}
+                        Some((Event::Start(Tag::Emphasis), _)) => emphasis_level |= 1,
+                        Some((Event::End(TagEnd::Emphasis), _)) => emphasis_level &= !1,
+                        Some((Event::Start(Tag::Strong), _)) => emphasis_level |= 2,
+                        Some((Event::End(TagEnd::Strong), _)) => emphasis_level &= !2,
                         Some((Event::Start(Tag::Paragraph), _)) => {
                             let (para_spans, _) = collect_spans_until_end_ranged(iter, TagEnd::Paragraph);
                             spans.extend(para_spans);
