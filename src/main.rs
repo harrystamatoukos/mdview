@@ -6,6 +6,7 @@ mod editor;
 mod parser;
 mod pager;
 mod position;
+mod primitives;  // New type-safe coordinate primitives
 mod renderer;
 mod selection;
 mod theme;
