@@ -60,7 +60,7 @@ const IDLE_POLL_MS: u64 = 50;
 impl<'a> Pager<'a> {
     pub fn new(editor: EditorState, terminal_width: u16, theme: Theme) -> Self {
         // Initial render
-        let (content, layout_map) = renderer::render_to_text_mapped(
+        let (content, layout_map) = renderer::render_to_text(
             editor.content(),
             terminal_width.saturating_sub(LEFT_MARGIN as u16),
             &theme
@@ -98,7 +98,7 @@ impl<'a> Pager<'a> {
     /// Preserves cursor position where possible
     fn re_render(&mut self) {
         // Re-render with current editor content
-        let (content, layout_map) = renderer::render_to_text_mapped(
+        let (content, layout_map) = renderer::render_to_text(
             self.editor.content(),
             self.terminal_width.saturating_sub(LEFT_MARGIN as u16),
             &self.theme
