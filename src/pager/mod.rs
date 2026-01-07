@@ -35,7 +35,7 @@ pub struct Pager<'a> {
     layout_map: LayoutMap,
     view: ViewState,       // Scroll position and animation
     input: InputState,     // Mouse/click state
-    cursor: CursorState,   // Cursor position and visibility
+    cursor: CursorState,   // Display state only (visibility, visual override) - position is in editor
     total_lines: usize,
     theme: Theme,
     // Selection state
@@ -66,18 +66,21 @@ impl<'a> Pager<'a> {
             &theme
         );
         let total_lines = content.lines.len();
-        // Start cursor at first valid source position
-        let cursor_pos = layout_map.first_offset();
+
+        // Set cursor to first valid source position (editor is source of truth)
+        if let Some(pos) = layout_map.first_offset() {
+            editor.set_cursor(pos);
+        }
 
         // Initialize selection at cursor position
-        let selection = Selection::new(cursor_pos.unwrap_or(ByteOffset::ZERO));
+        let selection = Selection::new(editor.cursor());
 
         Self {
             content,
             layout_map,
             view: ViewState::new(),
             input: InputState::new(),
-            cursor: CursorState::new(cursor_pos),
+            cursor: CursorState::new(), // Display state only, position is in editor
             total_lines,
             theme,
             selection,
@@ -95,7 +98,7 @@ impl<'a> Pager<'a> {
     }
 
     /// Re-render content after editing
-    /// Preserves cursor position where possible
+    /// Cursor position is maintained in editor state
     fn re_render(&mut self) {
         // Re-render with current document - no redundant parsing
         let (content, layout_map) = renderer::render_to_text(
@@ -107,10 +110,6 @@ impl<'a> Pager<'a> {
         self.content = content;
         self.layout_map = layout_map;
         self.total_lines = self.content.lines.len();
-
-        // Sync cursor from editor state
-        let editor_cursor = self.editor.cursor();
-        self.cursor.set_position(editor_cursor);
 
         // Build index for fast lookups
         self.layout_map.build_index();
@@ -138,7 +137,6 @@ impl<'a> Pager<'a> {
             self.editor.set_cursor(insert_offset);
             self.editor.insert_str("\n\n");
             // Cursor is now positioned after the newlines, ready for new content
-            self.cursor.set_position(self.editor.cursor());
             self.selection.move_to(self.editor.cursor());
         }
 
@@ -147,17 +145,11 @@ impl<'a> Pager<'a> {
             self.delete_selection();
         }
 
-        // Sync editor cursor from current visual cursor
-        if let Some(offset) = self.cursor.position() {
-            self.editor.set_cursor(offset);
-        }
-
         // Smart punctuation - automatic typographic improvements (fast O(1) operation)
         let smart_ch = self.apply_smart_punctuation(ch);
 
         // Insert the character directly - no pending states for maximum responsiveness
         self.editor.insert_char(smart_ch);
-        self.cursor.set_position(self.editor.cursor());
         self.selection.move_to(self.editor.cursor());
 
         // Re-render
@@ -167,7 +159,6 @@ impl<'a> Pager<'a> {
     /// Insert bold markers (**)
     fn insert_bold_markers(&mut self) {
         self.editor.insert_str("**");
-        self.cursor.set_position(self.editor.cursor());
         self.selection.move_to(self.editor.cursor());
         self.re_render();
     }
@@ -175,7 +166,6 @@ impl<'a> Pager<'a> {
     /// Insert italic marker (*)
     fn insert_italic_marker(&mut self) {
         self.editor.insert_char('*');
-        self.cursor.set_position(self.editor.cursor());
         self.selection.move_to(self.editor.cursor());
         self.re_render();
     }
@@ -183,7 +173,6 @@ impl<'a> Pager<'a> {
     /// Insert code marker (`)
     fn insert_code_marker(&mut self) {
         self.editor.insert_char('`');
-        self.cursor.set_position(self.editor.cursor());
         self.selection.move_to(self.editor.cursor());
         self.re_render();
     }
@@ -239,7 +228,7 @@ impl<'a> Pager<'a> {
             // Move cursor to end of now-unformatted text
             let new_cursor = end - open_len;
             self.editor.set_cursor(new_cursor);
-            self.cursor.set_position(new_cursor);
+            self.editor.set_cursor(new_cursor);
             self.selection.move_to(new_cursor);
         } else {
             // Check if selection CONTAINS the markers (user selected the formatted text including markers)
@@ -256,7 +245,7 @@ impl<'a> Pager<'a> {
 
                 let new_cursor = start + inner_owned.len();
                 self.editor.set_cursor(new_cursor);
-                self.cursor.set_position(new_cursor);
+                self.editor.set_cursor(new_cursor);
                 self.selection.move_to(new_cursor);
             } else {
                 // Not formatted - ADD the markers
@@ -271,7 +260,7 @@ impl<'a> Pager<'a> {
                 // Move cursor after the formatted content
                 let new_cursor = end + open_len + close_len;
                 self.editor.set_cursor(new_cursor);
-                self.cursor.set_position(new_cursor);
+                self.editor.set_cursor(new_cursor);
                 self.selection.move_to(new_cursor);
             }
         }
@@ -295,7 +284,7 @@ impl<'a> Pager<'a> {
         // Move cursor after the formatted content
         let new_cursor = end + open.len() + close.len();
         self.editor.set_cursor(new_cursor);
-        self.cursor.set_position(new_cursor);
+        self.editor.set_cursor(new_cursor);
 
         // Clear selection and re-render
         self.selection.move_to(new_cursor);
@@ -304,7 +293,8 @@ impl<'a> Pager<'a> {
 
     /// Toggle heading level at current line (Ctrl+1/2/3)
     fn toggle_heading(&mut self, level: u8) {
-        if let Some(cursor_pos) = self.cursor.position() {
+        {
+            let cursor_pos = self.editor.cursor();
             let line_start = self.editor.line_start(cursor_pos);
             let line = self.editor.line_content(cursor_pos);
 
@@ -338,7 +328,7 @@ impl<'a> Pager<'a> {
             }
 
             // Update cursor position
-            self.cursor.set_position(self.editor.cursor());
+            // Editor is source of truth for cursor
             self.selection.move_to(self.editor.cursor());
             self.re_render();
         }
@@ -347,7 +337,7 @@ impl<'a> Pager<'a> {
     /// Undo the last edit operation (Ctrl+Z)
     fn handle_undo(&mut self) {
         if let Some(cursor_pos) = self.editor.undo() {
-            self.cursor.set_position(cursor_pos);
+            self.editor.set_cursor(cursor_pos);
             self.selection.move_to(cursor_pos);
             self.re_render();
         }
@@ -356,7 +346,7 @@ impl<'a> Pager<'a> {
     /// Redo the last undone operation (Ctrl+Shift+Z or Ctrl+Y)
     fn handle_redo(&mut self) {
         if let Some(cursor_pos) = self.editor.redo() {
-            self.cursor.set_position(cursor_pos);
+            self.editor.set_cursor(cursor_pos);
             self.selection.move_to(cursor_pos);
             self.re_render();
         }
@@ -366,7 +356,8 @@ impl<'a> Pager<'a> {
     /// If selection: wraps selected text as link text, cursor moves to URL placeholder
     /// If no selection: inserts [text](url) template, cursor at "text"
     fn insert_link(&mut self) {
-        if let Some(cursor_pos) = self.cursor.position() {
+        {
+            let cursor_pos = self.editor.cursor();
             if self.selection.is_active() {
                 // Wrap selection as link
                 let (start, end) = self.selection.range();
@@ -383,7 +374,6 @@ impl<'a> Pager<'a> {
                 // end + "[" (1) + "](" (2) = end + 3, plus we want to be at 'u', so end + 3
                 let url_pos = end + 3;
                 self.editor.set_cursor(url_pos);
-                self.cursor.set_position(url_pos);
                 self.selection.move_to(url_pos);
             } else {
                 // No selection: insert template
@@ -393,7 +383,6 @@ impl<'a> Pager<'a> {
                 // Position cursor at start of "text" (after '[')
                 let text_pos = cursor_pos + 1;
                 self.editor.set_cursor(text_pos);
-                self.cursor.set_position(text_pos);
                 self.selection.move_to(text_pos);
             }
             self.re_render();
@@ -415,11 +404,12 @@ impl<'a> Pager<'a> {
         }
 
         // Sync editor cursor
-        if let Some(offset) = self.cursor.position() {
+        {
+            let offset = self.editor.cursor();
             self.editor.set_cursor(offset);
         }
 
-        let Some(cursor_pos) = self.cursor.position() else { return };
+        let cursor_pos = self.editor.cursor();
 
         let line = self.editor.line_content(cursor_pos);
         let line_start = self.editor.line_start(cursor_pos);
@@ -435,7 +425,7 @@ impl<'a> Pager<'a> {
                 self.editor.delete_range(line_start, line_start + list_info.marker_len);
                 self.editor.set_cursor(line_start);
                 self.editor.insert_char('\n');
-                self.cursor.set_position(line_start + 1);
+                self.editor.set_cursor(line_start + 1);
                 self.selection.move_to(line_start + 1);
             } else {
                 // Continue list: insert newline + marker
@@ -444,7 +434,7 @@ impl<'a> Pager<'a> {
                 self.editor.insert_str(&list_info.marker);
 
                 let new_cursor = cursor_pos + 1 + list_info.marker.len();
-                self.cursor.set_position(new_cursor);
+                self.editor.set_cursor(new_cursor);
                 self.selection.move_to(new_cursor);
             }
             self.re_render();
@@ -473,7 +463,7 @@ impl<'a> Pager<'a> {
                 self.editor.delete_range(line_start, line_start + marker_end);
                 self.editor.set_cursor(line_start);
                 self.editor.insert_char('\n');
-                self.cursor.set_position(line_start + 1);
+                self.editor.set_cursor(line_start + 1);
                 self.selection.move_to(line_start + 1);
             } else {
                 // Continue blockquote
@@ -482,7 +472,7 @@ impl<'a> Pager<'a> {
                 self.editor.insert_str(&quote_marker);
 
                 let new_cursor = cursor_pos + 1 + quote_marker.len();
-                self.cursor.set_position(new_cursor);
+                self.editor.set_cursor(new_cursor);
                 self.selection.move_to(new_cursor);
             }
             self.re_render();
@@ -496,7 +486,7 @@ impl<'a> Pager<'a> {
         self.editor.set_cursor(cursor_pos);
         self.editor.insert_str("  \n");
         let new_cursor = cursor_pos + 3; // "  \n" is 3 bytes
-        self.cursor.set_position(new_cursor);
+        self.editor.set_cursor(new_cursor);
         self.selection.move_to(new_cursor);
 
         self.re_render();
@@ -505,7 +495,8 @@ impl<'a> Pager<'a> {
 
     /// Handle Tab key - indent list item/blockquote, or insert spaces
     fn handle_tab(&mut self) {
-        if let Some(cursor_pos) = self.cursor.position() {
+        {
+            let cursor_pos = self.editor.cursor();
             let line = self.editor.line_content(cursor_pos);
             let line_start = self.editor.line_start(cursor_pos);
 
@@ -514,7 +505,7 @@ impl<'a> Pager<'a> {
                 // Insert 2 spaces at line start (standard markdown indent)
                 self.editor.insert_at(line_start, "  ");
                 // Cursor position is adjusted by insert_at
-                self.cursor.set_position(self.editor.cursor());
+                // Editor is source of truth for cursor
                 self.selection.move_to(self.editor.cursor());
                 self.re_render();
             } else {
@@ -522,7 +513,7 @@ impl<'a> Pager<'a> {
                 // Use 4 spaces as a "tab" equivalent
                 self.editor.set_cursor(cursor_pos);
                 self.editor.insert_str("    ");
-                self.cursor.set_position(self.editor.cursor());
+                // Editor is source of truth for cursor
                 self.selection.move_to(self.editor.cursor());
                 self.re_render();
             }
@@ -539,7 +530,7 @@ impl<'a> Pager<'a> {
     /// Fast O(1) lookups only - no content modification for speed
     fn apply_smart_punctuation(&self, ch: char) -> char {
         let content = self.editor.content();
-        let cursor = self.cursor.position().unwrap_or(ByteOffset::ZERO);
+        let cursor = self.editor.cursor();
 
         match ch {
             // Smart double quotes
@@ -577,9 +568,10 @@ impl<'a> Pager<'a> {
     fn cursor_word_left(&mut self) {
         self.cursor.clear_visual_override();
         self.pending_paragraph = None;
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             let new_pos = self.editor.word_start(current);
-            self.cursor.set_position(new_pos);
+            self.editor.set_cursor(new_pos);
             self.editor.set_cursor(new_pos);
             self.ensure_cursor_visible();
         }
@@ -589,9 +581,10 @@ impl<'a> Pager<'a> {
     fn cursor_word_right(&mut self) {
         self.cursor.clear_visual_override();
         self.pending_paragraph = None;
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             let new_pos = self.editor.word_end(current);
-            self.cursor.set_position(new_pos);
+            self.editor.set_cursor(new_pos);
             self.editor.set_cursor(new_pos);
             self.ensure_cursor_visible();
         }
@@ -601,9 +594,10 @@ impl<'a> Pager<'a> {
     fn cursor_line_start(&mut self) {
         self.cursor.clear_visual_override();
         self.pending_paragraph = None;
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             let new_pos = self.editor.line_start(current);
-            self.cursor.set_position(new_pos);
+            self.editor.set_cursor(new_pos);
             self.editor.set_cursor(new_pos);
             self.ensure_cursor_visible();
         }
@@ -613,9 +607,10 @@ impl<'a> Pager<'a> {
     fn cursor_line_end(&mut self) {
         self.cursor.clear_visual_override();
         self.pending_paragraph = None;
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             let new_pos = self.editor.line_end(current);
-            self.cursor.set_position(new_pos);
+            self.editor.set_cursor(new_pos);
             self.editor.set_cursor(new_pos);
             self.ensure_cursor_visible();
         }
@@ -629,12 +624,13 @@ impl<'a> Pager<'a> {
             return;
         }
 
-        if let Some(offset) = self.cursor.position() {
+        {
+            let offset = self.editor.cursor();
             self.editor.set_cursor(offset);
         }
 
         if self.editor.delete_word_before() {
-            self.cursor.set_position(self.editor.cursor());
+            // Editor is source of truth for cursor
             self.selection.move_to(self.editor.cursor());
             self.re_render();
         }
@@ -648,12 +644,13 @@ impl<'a> Pager<'a> {
             return;
         }
 
-        if let Some(offset) = self.cursor.position() {
+        {
+            let offset = self.editor.cursor();
             self.editor.set_cursor(offset);
         }
 
         if self.editor.delete_word_after() {
-            self.cursor.set_position(self.editor.cursor());
+            // Editor is source of truth for cursor
             self.selection.move_to(self.editor.cursor());
             self.re_render();
         }
@@ -661,11 +658,12 @@ impl<'a> Pager<'a> {
 
     /// Select word at current cursor position (for double-click)
     fn select_word_at_cursor(&mut self) {
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             let (start, end) = self.editor.word_at(current);
             if start < end {
                 self.selection = Selection::from_range(start, end);
-                self.cursor.set_position(end);
+                self.editor.set_cursor(end);
                 self.editor.set_cursor(end);
             }
         }
@@ -673,13 +671,14 @@ impl<'a> Pager<'a> {
 
     /// Select entire line/paragraph at cursor (for triple-click)
     fn select_line_at_cursor(&mut self) {
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             let start = self.editor.line_start(current);
             let end = self.editor.line_end(current);
             // Include the newline if there is one
             let end = if end.get() < self.editor.len() { end + 1 } else { end };
             self.selection = Selection::from_range(start, end);
-            self.cursor.set_position(end);
+            self.editor.set_cursor(end);
             self.editor.set_cursor(end);
         }
     }
@@ -713,7 +712,7 @@ impl<'a> Pager<'a> {
         if line_has_content {
             // Normal click - find nearest source position on this line
             if let Some(offset) = self.layout_map.screen_to_source_nearest(content_line, content_col) {
-                self.cursor.set_position(offset);
+                self.editor.set_cursor(offset);
                 self.editor.set_cursor(offset);
 
                 match click_type {
@@ -745,7 +744,8 @@ impl<'a> Pager<'a> {
 
     /// Handle Shift+Tab key - outdent list item or remove leading indentation
     fn handle_shift_tab(&mut self) {
-        if let Some(cursor_pos) = self.cursor.position() {
+        {
+            let cursor_pos = self.editor.cursor();
             let line = self.editor.line_content(cursor_pos);
             let line_start = self.editor.line_start(cursor_pos);
 
@@ -761,7 +761,7 @@ impl<'a> Pager<'a> {
                 };
                 self.editor.delete_range(line_start, line_start + spaces_to_remove);
                 // Update cursor position
-                self.cursor.set_position(self.editor.cursor());
+                // Editor is source of truth for cursor
                 self.selection.move_to(self.editor.cursor());
                 self.re_render();
             }
@@ -782,13 +782,14 @@ impl<'a> Pager<'a> {
         }
 
         // Sync editor cursor
-        if let Some(offset) = self.cursor.position() {
+        {
+            let offset = self.editor.cursor();
             self.editor.set_cursor(offset);
         }
 
         // Simple delete - no complex formatting boundary detection for speed
         if self.editor.delete_before() {
-            self.cursor.set_position(self.editor.cursor());
+            // Editor is source of truth for cursor
             self.selection.move_to(self.editor.cursor());
             self.re_render();
         }
@@ -808,13 +809,14 @@ impl<'a> Pager<'a> {
         }
 
         // Sync editor cursor
-        if let Some(offset) = self.cursor.position() {
+        {
+            let offset = self.editor.cursor();
             self.editor.set_cursor(offset);
         }
 
         // Simple delete - no complex formatting boundary detection for speed
         if self.editor.delete_at() {
-            self.cursor.set_position(self.editor.cursor());
+            // Editor is source of truth for cursor
             self.re_render();
         }
     }
@@ -862,7 +864,7 @@ impl<'a> Pager<'a> {
         let (start, end) = self.selection.range();
         self.editor.set_cursor(start);
         self.editor.delete_range(start, end);
-        self.cursor.set_position(self.editor.cursor());
+        // Editor is source of truth for cursor
         self.selection.move_to(self.editor.cursor());
         self.re_render();
     }
@@ -892,11 +894,12 @@ impl<'a> Pager<'a> {
                 }
 
                 // Sync cursor and insert
-                if let Some(offset) = self.cursor.position() {
+                {
+            let offset = self.editor.cursor();
                     self.editor.set_cursor(offset);
                 }
                 self.editor.insert_str(&text);
-                self.cursor.set_position(self.editor.cursor());
+                // Editor is source of truth for cursor
                 self.selection.move_to(self.editor.cursor());
                 self.re_render();
             }
@@ -907,26 +910,25 @@ impl<'a> Pager<'a> {
     fn select_all(&mut self) {
         self.selection.select_all(self.editor.content().len());
         // Move cursor to end of selection
-        self.cursor.set_position(self.selection.cursor);
+        self.editor.set_cursor(self.selection.cursor);
     }
 
     /// Clear selection (collapse to cursor)
     fn clear_selection(&mut self) {
-        if let Some(cursor) = self.cursor.position() {
-            self.selection.move_to(cursor);
-        }
+        let cursor = self.editor.cursor();
+        self.selection.move_to(cursor);
     }
 
     /// Extend selection to a new position (for Shift+Arrow)
     fn extend_selection_to(&mut self, new_cursor: ByteOffset) {
         self.selection.extend_to(new_cursor);
-        self.cursor.set_position(new_cursor);
+        self.editor.set_cursor(new_cursor);
     }
 
     /// Move cursor and clear selection (for Arrow without Shift)
     fn move_cursor_to(&mut self, new_cursor: ByteOffset) {
         self.selection.move_to(new_cursor);
-        self.cursor.set_position(new_cursor);
+        self.editor.set_cursor(new_cursor);
     }
 
     /// Handle mouse drag start
@@ -948,7 +950,7 @@ impl<'a> Pager<'a> {
         // Start selection at clicked position
         if let Some(offset) = self.layout_map.screen_to_source_nearest(content_line, content_col) {
             self.selection = Selection::new(offset);
-            self.cursor.set_position(offset);
+            self.editor.set_cursor(offset);
             self.editor.set_cursor(offset);
             self.input.start_drag();
         }
@@ -973,7 +975,7 @@ impl<'a> Pager<'a> {
         // Extend selection to current position
         if let Some(offset) = self.layout_map.screen_to_source_nearest(content_line, content_col) {
             self.selection.extend_to(offset);
-            self.cursor.set_position(offset);
+            self.editor.set_cursor(offset);
         }
     }
 
@@ -1021,9 +1023,10 @@ impl<'a> Pager<'a> {
     fn cursor_right(&mut self) {
         self.cursor.clear_visual_override();
         self.pending_paragraph = None;
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             if let Some(next) = self.layout_map.next_cursor_position(current) {
-                self.cursor.set_position(next);
+                self.editor.set_cursor(next);
                 self.editor.set_cursor(next);
                 self.ensure_cursor_visible();
             }
@@ -1034,9 +1037,9 @@ impl<'a> Pager<'a> {
     fn cursor_left(&mut self) {
         self.cursor.clear_visual_override();
         self.pending_paragraph = None;
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             if let Some(prev) = self.layout_map.prev_cursor_position(current) {
-                self.cursor.set_position(prev);
                 self.editor.set_cursor(prev);
                 self.ensure_cursor_visible();
             }
@@ -1047,12 +1050,13 @@ impl<'a> Pager<'a> {
     fn cursor_up(&mut self, viewport_height: usize) {
         self.cursor.clear_visual_override();
         self.pending_paragraph = None;
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             if let Some(pos) = self.layout_map.source_to_screen(current) {
                 if pos.line > 0 {
                     // Try to maintain column position on line above
                     if let Some(offset) = self.layout_map.screen_to_source_nearest(pos.line - 1, pos.col) {
-                        self.cursor.set_position(offset);
+                        self.editor.set_cursor(offset);
                         self.editor.set_cursor(offset);
                         self.ensure_cursor_visible_with_viewport(viewport_height);
                     }
@@ -1065,12 +1069,13 @@ impl<'a> Pager<'a> {
     fn cursor_down(&mut self, viewport_height: usize) {
         self.cursor.clear_visual_override();
         self.pending_paragraph = None;
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             if let Some(pos) = self.layout_map.source_to_screen(current) {
                 if pos.line + 1 < self.layout_map.line_count() {
                     // Try to maintain column position on line below
                     if let Some(offset) = self.layout_map.screen_to_source_nearest(pos.line + 1, pos.col) {
-                        self.cursor.set_position(offset);
+                        self.editor.set_cursor(offset);
                         self.editor.set_cursor(offset);
                         self.ensure_cursor_visible_with_viewport(viewport_height);
                     }
@@ -1085,7 +1090,8 @@ impl<'a> Pager<'a> {
     }
 
     fn ensure_cursor_visible_with_viewport(&mut self, viewport_height: usize) {
-        if let Some(current) = self.cursor.position() {
+        {
+            let current = self.editor.cursor();
             if let Some(pos) = self.layout_map.source_to_screen(current) {
                 // Use ViewState's ensure_line_visible with a margin
                 let margin = 3.min(viewport_height / 4);
@@ -1105,7 +1111,7 @@ impl<'a> Pager<'a> {
         if let Some((_, line, col)) = self.pending_paragraph {
             return Some(ScreenPos::new(line, col));
         }
-        self.cursor.position().and_then(|offset| self.layout_map.source_to_screen(offset))
+        self.layout_map.source_to_screen(self.editor.cursor())
     }
 
     /// Get screen positions for active selection (for highlighting)
@@ -1136,7 +1142,7 @@ impl<'a> Pager<'a> {
 
         // Try to find source offset at this position
         if let Some(offset) = self.layout_map.screen_to_source_nearest(content_line, content_col) {
-            self.cursor.set_position(offset);
+            self.editor.set_cursor(offset);
             // Sync editor cursor
             self.editor.set_cursor(offset);
         }
@@ -1231,7 +1237,8 @@ fn run_event_loop(
 
                             // Arrow keys with Shift = extend selection
                             KeyCode::Up if shift => {
-                                if let Some(current) = pager.cursor.position() {
+                                {
+                                    let current = pager.editor.cursor();
                                     if let Some(pos) = pager.layout_map.source_to_screen(current) {
                                         if pos.line > 0 {
                                             if let Some(new_pos) = pager.layout_map.screen_to_source_nearest(pos.line - 1, pos.col) {
@@ -1243,7 +1250,8 @@ fn run_event_loop(
                                 }
                             }
                             KeyCode::Down if shift => {
-                                if let Some(current) = pager.cursor.position() {
+                                {
+                                    let current = pager.editor.cursor();
                                     if let Some(pos) = pager.layout_map.source_to_screen(current) {
                                         if pos.line + 1 < pager.layout_map.line_count() {
                                             if let Some(new_pos) = pager.layout_map.screen_to_source_nearest(pos.line + 1, pos.col) {
@@ -1255,7 +1263,8 @@ fn run_event_loop(
                                 }
                             }
                             KeyCode::Left if shift => {
-                                if let Some(current) = pager.cursor.position() {
+                                {
+                                    let current = pager.editor.cursor();
                                     if let Some(prev) = pager.layout_map.prev_cursor_position(current) {
                                         pager.extend_selection_to(prev);
                                         pager.ensure_cursor_visible();
@@ -1263,7 +1272,8 @@ fn run_event_loop(
                                 }
                             }
                             KeyCode::Right if shift => {
-                                if let Some(current) = pager.cursor.position() {
+                                {
+                                    let current = pager.editor.cursor();
                                     if let Some(next) = pager.layout_map.next_cursor_position(current) {
                                         pager.extend_selection_to(next);
                                         pager.ensure_cursor_visible();
@@ -1274,7 +1284,8 @@ fn run_event_loop(
                             // Word-level movement with Ctrl (like Google Docs)
                             KeyCode::Left if ctrl && shift => {
                                 // Ctrl+Shift+Left = extend selection to previous word
-                                if let Some(current) = pager.cursor.position() {
+                                {
+                                    let current = pager.editor.cursor();
                                     let new_pos = pager.editor.word_start(current);
                                     pager.extend_selection_to(new_pos);
                                     pager.ensure_cursor_visible();
@@ -1282,7 +1293,8 @@ fn run_event_loop(
                             }
                             KeyCode::Right if ctrl && shift => {
                                 // Ctrl+Shift+Right = extend selection to next word
-                                if let Some(current) = pager.cursor.position() {
+                                {
+                                    let current = pager.editor.cursor();
                                     let new_pos = pager.editor.word_end(current);
                                     pager.extend_selection_to(new_pos);
                                     pager.ensure_cursor_visible();
@@ -1320,7 +1332,8 @@ fn run_event_loop(
                             // Home/End for line navigation (like Google Docs)
                             KeyCode::Home if shift => {
                                 // Shift+Home = extend selection to line start
-                                if let Some(current) = pager.cursor.position() {
+                                {
+                                    let current = pager.editor.cursor();
                                     let line_start = pager.editor.line_start(current);
                                     pager.extend_selection_to(line_start);
                                     pager.ensure_cursor_visible();
@@ -1328,7 +1341,8 @@ fn run_event_loop(
                             }
                             KeyCode::End if shift => {
                                 // Shift+End = extend selection to line end
-                                if let Some(current) = pager.cursor.position() {
+                                {
+                                    let current = pager.editor.cursor();
                                     let line_end = pager.editor.line_end(current);
                                     pager.extend_selection_to(line_end);
                                     pager.ensure_cursor_visible();
@@ -1337,7 +1351,6 @@ fn run_event_loop(
                             KeyCode::Home if ctrl => {
                                 // Ctrl+Home = jump to document start
                                 pager.clear_selection();
-                                pager.cursor.set_position(ByteOffset::ZERO);
                                 pager.editor.set_cursor(ByteOffset::ZERO);
                                 pager.selection.move_to(ByteOffset::ZERO);
                                 pager.scroll_to_top();
@@ -1346,7 +1359,6 @@ fn run_event_loop(
                                 // Ctrl+End = jump to document end
                                 pager.clear_selection();
                                 let end = ByteOffset(pager.editor.len());
-                                pager.cursor.set_position(end);
                                 pager.editor.set_cursor(end);
                                 pager.selection.move_to(end);
                                 pager.scroll_to_bottom(viewport_height);
