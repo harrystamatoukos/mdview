@@ -196,32 +196,28 @@ impl Theme {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Code - distinct but not jarring
-    // Research: different background helps, keep syntax subtle
-    //
-    // NOTE: inline_code() is defined for future theme support but
-    // currently unused. We use ‹code› markers instead of color to
-    // respect terminal defaults for body text (Design Principle #5).
-    // This keeps reading flow smooth while still distinguishing code.
+    // Code - subtle distinction, respects terminal colors
+    // Per DESIGN_PRINCIPLES: code should recede, not dominate
     // ─────────────────────────────────────────────────────────────
 
-    #[allow(dead_code)] // Reserved for future theme variants
     pub fn inline_code(&self) -> Style {
-        // Aqua/cyan - stands out but isn't harsh
+        // Subtle: just dim the text slightly, no background or color change
+        // Reader's focus should be on content, not code styling
         Style::default()
-            .fg(Color::Rgb(142, 192, 124))  // Gruvbox aqua/green
+            .add_modifier(Modifier::DIM)
     }
 
     pub fn code_block(&self) -> Style {
-        // Slightly different feel for code
+        // Use terminal default - code blocks are already visually separated
+        // by indentation and whitespace
         Style::default()
-            .fg(Color::Rgb(189, 174, 147))  // Warm light gray
     }
 
     pub fn code_border(&self) -> Style {
-        // Unified chrome color for structural elements
+        // Very subtle - borders should almost disappear
         Style::default()
             .fg(self.chrome_color())
+            .add_modifier(Modifier::DIM)
     }
 
     // ─────────────────────────────────────────────────────────────

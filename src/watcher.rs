@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::document::Document;
 use crate::renderer;
 use crate::theme::Theme;
 
@@ -111,7 +112,8 @@ pub fn watch_and_display(path: &Path, theme: Theme) -> Result<()> {
 
     let size = terminal.size()?;
     let content = std::fs::read_to_string(path)?;
-    let (text, _) = renderer::render_to_text(&content, size.width.saturating_sub(4), &theme);
+    let mut document = Document::new(content);
+    let (text, _) = renderer::render_to_text(&mut document, size.width.saturating_sub(4), &theme);
     let mut pager = WatchPager::new(text, theme);
 
     let (tx, rx) = mpsc::channel();
@@ -150,7 +152,8 @@ fn run_watch_loop(
             while file_rx.try_recv().is_ok() {}
 
             if let Ok(content) = std::fs::read_to_string(path) {
-                let (text, _) = renderer::render_to_text(&content, width.saturating_sub(4), &pager.theme);
+                let mut document = Document::new(content);
+                let (text, _) = renderer::render_to_text(&mut document, width.saturating_sub(4), &pager.theme);
                 pager.update_content(text);
             }
         }
@@ -190,7 +193,8 @@ fn run_watch_loop(
                         KeyCode::End => pager.scroll_to_bottom(viewport_height),
                         KeyCode::Char('r') => {
                             if let Ok(content) = std::fs::read_to_string(path) {
-                                let (text, _) = renderer::render_to_text(&content, width.saturating_sub(4), &pager.theme);
+                                let mut document = Document::new(content);
+                                let (text, _) = renderer::render_to_text(&mut document, width.saturating_sub(4), &pager.theme);
                                 pager.update_content(text);
                             }
                         }

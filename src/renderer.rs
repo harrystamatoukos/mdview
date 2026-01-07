@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use crate::document::Document;
 use crate::parser::{self, Element, Span, SpanKind};
 use crate::position::{FormattingKind, FormattingSpan, LayoutMap, MappedChar};
 use crate::theme::{
@@ -94,10 +95,15 @@ pub fn render(content: &str) -> String {
 
 /// Render markdown to ratatui Text WITH position mapping for WYSIWYG editing
 /// Returns both the visual Text and a LayoutMap for cursor navigation
-pub fn render_to_text(content: &str, terminal_width: u16, theme: &Theme) -> (Text<'static>, LayoutMap) {
-    let elements = parser::parse(content);
+///
+/// Takes a Document reference, using its pre-parsed elements to avoid redundant parsing.
+/// The Document will parse automatically on first access if needed.
+pub fn render_to_text(document: &mut Document, terminal_width: u16, theme: &Theme) -> (Text<'static>, LayoutMap) {
+    // Get source_len before mutable borrow for elements
+    let source_len = document.source_len();
+    let elements = document.elements();
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut layout_map = LayoutMap::new(content.len());
+    let mut layout_map = LayoutMap::new(source_len);
 
     // Calculate centering: how much left margin to add
     let content_width = OPTIMAL_WIDTH.min(terminal_width as usize - LEFT_MARGIN);
