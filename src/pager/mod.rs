@@ -19,7 +19,7 @@ use crate::cursor::CursorState;
 use crate::editor::EditorState;
 use crate::input::{ClickType, InputState};
 use crate::position::LayoutMap;
-use crate::primitives::ByteOffset;
+use crate::primitives::{ByteOffset, ScreenPos};
 use crate::renderer;
 use crate::selection::Selection;
 use crate::theme::{Theme, LEFT_MARGIN};
@@ -1048,10 +1048,10 @@ impl<'a> Pager<'a> {
         self.cursor.clear_visual_override();
         self.pending_paragraph = None;
         if let Some(current) = self.cursor.position() {
-            if let Some((line, col)) = self.layout_map.source_to_screen(current) {
-                if line > 0 {
+            if let Some(pos) = self.layout_map.source_to_screen(current) {
+                if pos.line > 0 {
                     // Try to maintain column position on line above
-                    if let Some(offset) = self.layout_map.screen_to_source_nearest(line - 1, col) {
+                    if let Some(offset) = self.layout_map.screen_to_source_nearest(pos.line - 1, pos.col) {
                         self.cursor.set_position(offset);
                         self.editor.set_cursor(offset);
                         self.ensure_cursor_visible_with_viewport(viewport_height);
@@ -1066,10 +1066,10 @@ impl<'a> Pager<'a> {
         self.cursor.clear_visual_override();
         self.pending_paragraph = None;
         if let Some(current) = self.cursor.position() {
-            if let Some((line, col)) = self.layout_map.source_to_screen(current) {
-                if line + 1 < self.layout_map.line_count() {
+            if let Some(pos) = self.layout_map.source_to_screen(current) {
+                if pos.line + 1 < self.layout_map.line_count() {
                     // Try to maintain column position on line below
-                    if let Some(offset) = self.layout_map.screen_to_source_nearest(line + 1, col) {
+                    if let Some(offset) = self.layout_map.screen_to_source_nearest(pos.line + 1, pos.col) {
                         self.cursor.set_position(offset);
                         self.editor.set_cursor(offset);
                         self.ensure_cursor_visible_with_viewport(viewport_height);
@@ -1086,30 +1086,30 @@ impl<'a> Pager<'a> {
 
     fn ensure_cursor_visible_with_viewport(&mut self, viewport_height: usize) {
         if let Some(current) = self.cursor.position() {
-            if let Some((line, _)) = self.layout_map.source_to_screen(current) {
+            if let Some(pos) = self.layout_map.source_to_screen(current) {
                 // Use ViewState's ensure_line_visible with a margin
                 let margin = 3.min(viewport_height / 4);
-                self.view.ensure_line_visible(line, viewport_height, margin);
+                self.view.ensure_line_visible(pos.line, viewport_height, margin);
             }
         }
     }
 
-    /// Get cursor screen position (line, col) relative to content
+    /// Get cursor screen position relative to content
     /// Uses visual override if set (e.g., after Enter, before first keystroke)
-    fn cursor_screen_position(&self) -> Option<(usize, usize)> {
+    fn cursor_screen_position(&self) -> Option<ScreenPos> {
         // Visual override takes precedence (used after Enter to show where content WILL appear)
         if let Some(override_pos) = self.cursor.visual_override() {
             return Some(override_pos);
         }
         // Pending paragraph position (user clicked in empty space)
         if let Some((_, line, col)) = self.pending_paragraph {
-            return Some((line, col));
+            return Some(ScreenPos::new(line, col));
         }
         self.cursor.position().and_then(|offset| self.layout_map.source_to_screen(offset))
     }
 
     /// Get screen positions for active selection (for highlighting)
-    fn selection_screen_positions(&self) -> Vec<(usize, usize)> {
+    fn selection_screen_positions(&self) -> Vec<ScreenPos> {
         if !self.selection.is_active() {
             return Vec::new();
         }
@@ -1232,9 +1232,9 @@ fn run_event_loop(
                             // Arrow keys with Shift = extend selection
                             KeyCode::Up if shift => {
                                 if let Some(current) = pager.cursor.position() {
-                                    if let Some((line, col)) = pager.layout_map.source_to_screen(current) {
-                                        if line > 0 {
-                                            if let Some(new_pos) = pager.layout_map.screen_to_source_nearest(line - 1, col) {
+                                    if let Some(pos) = pager.layout_map.source_to_screen(current) {
+                                        if pos.line > 0 {
+                                            if let Some(new_pos) = pager.layout_map.screen_to_source_nearest(pos.line - 1, pos.col) {
                                                 pager.extend_selection_to(new_pos);
                                                 pager.ensure_cursor_visible_with_viewport(viewport_height);
                                             }
@@ -1244,9 +1244,9 @@ fn run_event_loop(
                             }
                             KeyCode::Down if shift => {
                                 if let Some(current) = pager.cursor.position() {
-                                    if let Some((line, col)) = pager.layout_map.source_to_screen(current) {
-                                        if line + 1 < pager.layout_map.line_count() {
-                                            if let Some(new_pos) = pager.layout_map.screen_to_source_nearest(line + 1, col) {
+                                    if let Some(pos) = pager.layout_map.source_to_screen(current) {
+                                        if pos.line + 1 < pager.layout_map.line_count() {
+                                            if let Some(new_pos) = pager.layout_map.screen_to_source_nearest(pos.line + 1, pos.col) {
                                                 pager.extend_selection_to(new_pos);
                                                 pager.ensure_cursor_visible_with_viewport(viewport_height);
                                             }
@@ -1511,11 +1511,11 @@ fn draw(frame: &mut Frame, pager: &mut Pager, viewport_height: usize) {
         let selection_style = Style::default().add_modifier(Modifier::REVERSED);
         let selection_positions = pager.selection_screen_positions();
 
-        for (line, col) in selection_positions {
+        for pos in selection_positions {
             // Only highlight if within visible viewport
-            if line >= scroll_pos && line < scroll_pos + viewport_height {
-                let screen_y = content_area.y + (line - scroll_pos) as u16;
-                let screen_x = content_area.x + col as u16;
+            if pos.line >= scroll_pos && pos.line < scroll_pos + viewport_height {
+                let screen_y = content_area.y + (pos.line - scroll_pos) as u16;
+                let screen_x = content_area.x + pos.col as u16;
 
                 // Only highlight if within content area bounds
                 if screen_x < content_area.x + content_area.width
@@ -1532,11 +1532,11 @@ fn draw(frame: &mut Frame, pager: &mut Pager, viewport_height: usize) {
 
     // Show cursor if visible and within viewport (terminal handles blink animation)
     if pager.cursor.is_visible() {
-        if let Some((cursor_line, cursor_col)) = pager.cursor_screen_position() {
+        if let Some(cursor_pos) = pager.cursor_screen_position() {
             // Check if cursor is within visible viewport
-            if cursor_line >= scroll_pos && cursor_line < scroll_pos + viewport_height {
-                let screen_y = content_area.y + (cursor_line - scroll_pos) as u16;
-                let screen_x = content_area.x + cursor_col as u16;
+            if cursor_pos.line >= scroll_pos && cursor_pos.line < scroll_pos + viewport_height {
+                let screen_y = content_area.y + (cursor_pos.line - scroll_pos) as u16;
+                let screen_x = content_area.x + cursor_pos.col as u16;
 
                 // Only show cursor if within content area bounds
                 if screen_x < content_area.x + content_area.width
