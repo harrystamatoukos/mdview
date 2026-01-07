@@ -15,7 +15,6 @@ use ratatui::{
 };
 use std::io::{self, stdout};
 
-use crate::cursor::CursorState;
 use crate::editor::EditorState;
 use crate::input::{ClickType, InputState};
 use crate::position::LayoutMap;
@@ -29,27 +28,31 @@ mod helpers;
 use helpers::{ListItemInfo, char_before, detect_blockquote, detect_heading_level, detect_list_item};
 
 /// Smooth scrolling pager with cursor, mouse support, and editing
+///
+/// Coordinates document state, rendering, and user interaction.
+/// The editor owns the cursor position, this struct handles display state.
 pub struct Pager<'a> {
+    // Core state (editor owns document and cursor position)
+    editor: EditorState,
+    selection: Selection,
+
     // Rendered content
     content: Text<'a>,
     layout_map: LayoutMap,
-    view: ViewState,       // Scroll position and animation
-    input: InputState,     // Mouse/click state
-    cursor: CursorState,   // Display state only (visibility, visual override) - position is in editor
     total_lines: usize,
-    theme: Theme,
-    // Selection state
-    selection: Selection,
-    // Editor state for text manipulation
-    editor: EditorState,
+
+    // UI state
+    view: ViewState,          // Scroll position and animation
+    input: InputState,        // Mouse/click state
+    cursor_visible: bool,     // For cursor blink animation
+    cursor_visual_override: Option<ScreenPos>,  // Position override (e.g., after Enter key)
     terminal_width: u16,
-    // Content area for mouse click handling (x, y, width, height)
-    content_area: (u16, u16, u16, u16),
-    // Edit mode (always on for fluid editing, can toggle to view mode with 'v')
-    edit_mode: bool,
-    // Pending paragraph - when user clicks in empty space, stores (source_offset, visual_line, visual_col)
-    // where source_offset is where to insert newlines, and visual position is where cursor appears
-    pending_paragraph: Option<(ByteOffset, usize, usize)>,
+    content_area: (u16, u16, u16, u16),  // Content area for mouse handling
+
+    // Mode state
+    edit_mode: bool,          // View mode vs edit mode
+    pending_paragraph: Option<(ByteOffset, usize, usize)>,  // Click in empty space state
+    theme: Theme,
 }
 
 // Minimum poll time during active editing (ms) - 60fps for smoothness
@@ -76,19 +79,20 @@ impl<'a> Pager<'a> {
         let selection = Selection::new(editor.cursor());
 
         Self {
+            editor,
+            selection,
             content,
             layout_map,
+            total_lines,
             view: ViewState::new(),
             input: InputState::new(),
-            cursor: CursorState::new(), // Display state only, position is in editor
-            total_lines,
-            theme,
-            selection,
-            editor,
+            cursor_visible: true,
+            cursor_visual_override: None,
             terminal_width,
-            content_area: (0, 0, 0, 0), // Will be set on first draw
-            edit_mode: true, // Always start in edit mode for fluid experience
+            content_area: (0, 0, 0, 0),
+            edit_mode: true,
             pending_paragraph: None,
+            theme,
         }
     }
 
@@ -129,7 +133,7 @@ impl<'a> Pager<'a> {
     /// Designed for maximum fluidity - no delays or pending states
     fn handle_char_input(&mut self, ch: char) {
         // Clear visual override - we now have real content to map to
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
 
         // Handle pending paragraph - user clicked in empty space and is now typing
         if let Some((insert_offset, _visual_line, _visual_col)) = self.pending_paragraph.take() {
@@ -396,7 +400,7 @@ impl<'a> Pager<'a> {
     fn handle_smart_enter(&mut self) {
         // Clear any pending paragraph or visual override
         self.pending_paragraph = None;
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
 
         // Delete selection first if any
         if self.selection.is_active() {
@@ -566,7 +570,7 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to previous word boundary (Ctrl+Left)
     fn cursor_word_left(&mut self) {
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
         {
             let current = self.editor.cursor();
@@ -579,7 +583,7 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to next word boundary (Ctrl+Right)
     fn cursor_word_right(&mut self) {
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
         {
             let current = self.editor.cursor();
@@ -592,7 +596,7 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to start of line (Home key)
     fn cursor_line_start(&mut self) {
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
         {
             let current = self.editor.cursor();
@@ -605,7 +609,7 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to end of line (End key)
     fn cursor_line_end(&mut self) {
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
         {
             let current = self.editor.cursor();
@@ -687,7 +691,7 @@ impl<'a> Pager<'a> {
     /// Supports clicking in empty space to create pending paragraphs
     fn handle_mouse_click(&mut self, screen_x: u16, screen_y: u16) {
         // Clear overrides - user is clicking to position
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
         let (area_x, area_y, area_width, area_height) = self.content_area;
 
@@ -772,7 +776,7 @@ impl<'a> Pager<'a> {
     /// Simple and fast for fluid editing
     fn handle_backspace(&mut self) {
         // Clear visual override - user is actively editing
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
 
         // If there's a selection, delete it instead
@@ -799,7 +803,7 @@ impl<'a> Pager<'a> {
     /// Simple and fast for fluid editing
     fn handle_delete(&mut self) {
         // Clear visual override - user is actively editing
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
 
         // If there's a selection, delete it instead
@@ -1021,7 +1025,7 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to next valid position (right arrow)
     fn cursor_right(&mut self) {
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
         {
             let current = self.editor.cursor();
@@ -1035,7 +1039,7 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to previous valid position (left arrow)
     fn cursor_left(&mut self) {
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
         {
             let current = self.editor.cursor();
@@ -1048,7 +1052,7 @@ impl<'a> Pager<'a> {
 
     /// Move cursor up one line - fluid movement like Google Docs
     fn cursor_up(&mut self, viewport_height: usize) {
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
         {
             let current = self.editor.cursor();
@@ -1067,7 +1071,7 @@ impl<'a> Pager<'a> {
 
     /// Move cursor down one line - fluid movement like Google Docs
     fn cursor_down(&mut self, viewport_height: usize) {
-        self.cursor.clear_visual_override();
+        self.cursor_visual_override = None;
         self.pending_paragraph = None;
         {
             let current = self.editor.cursor();
@@ -1104,7 +1108,7 @@ impl<'a> Pager<'a> {
     /// Uses visual override if set (e.g., after Enter, before first keystroke)
     fn cursor_screen_position(&self) -> Option<ScreenPos> {
         // Visual override takes precedence (used after Enter to show where content WILL appear)
-        if let Some(override_pos) = self.cursor.visual_override() {
+        if let Some(override_pos) = self.cursor_visual_override {
             return Some(override_pos);
         }
         // Pending paragraph position (user clicked in empty space)
@@ -1150,7 +1154,7 @@ impl<'a> Pager<'a> {
 
     /// Toggle cursor visibility
     fn toggle_cursor(&mut self) {
-        self.cursor.toggle_visibility();
+        self.cursor_visible = !self.cursor_visible;
     }
 }
 
@@ -1543,7 +1547,7 @@ fn draw(frame: &mut Frame, pager: &mut Pager, viewport_height: usize) {
     }
 
     // Show cursor if visible and within viewport (terminal handles blink animation)
-    if pager.cursor.is_visible() {
+    if pager.cursor_visible {
         if let Some(cursor_pos) = pager.cursor_screen_position() {
             // Check if cursor is within visible viewport
             if cursor_pos.line >= scroll_pos && cursor_pos.line < scroll_pos + viewport_height {

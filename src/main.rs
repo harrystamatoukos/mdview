@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 
-mod cursor;
 mod document;
 mod editor;
 mod input;
