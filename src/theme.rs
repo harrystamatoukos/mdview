@@ -284,6 +284,17 @@ impl Theme {
             .fg(Color::Rgb(152, 151, 26))   // Gruvbox green
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // Cursor - clear insertion point indicator
+    // ─────────────────────────────────────────────────────────────
+
+    pub fn cursor(&self) -> Style {
+        // Reversed colors make the cursor position unmistakable
+        // This shows exactly where the next character will appear
+        Style::default()
+            .add_modifier(Modifier::REVERSED)
+    }
+
     pub fn strikethrough(&self) -> Style {
         Style::default()
             .add_modifier(Modifier::CROSSED_OUT)

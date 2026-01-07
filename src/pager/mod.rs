@@ -1584,8 +1584,8 @@ fn draw(frame: &mut Frame, pager: &mut Pager, viewport_height: usize) {
         }
     }
 
-    // Show cursor if visible and within viewport (terminal handles blink animation)
-    if pager.cursor_visible {
+    // Show cursor if visible and within viewport
+    if pager.cursor_visible && pager.edit_mode {
         if let Some(cursor_pos) = pager.cursor_screen_position() {
             // Check if cursor is within visible viewport
             if cursor_pos.line >= scroll_pos && cursor_pos.line < scroll_pos + viewport_height {
@@ -1596,6 +1596,14 @@ fn draw(frame: &mut Frame, pager: &mut Pager, viewport_height: usize) {
                 if screen_x < content_area.x + content_area.width
                     && screen_y < content_area.y + content_area.height
                 {
+                    // Highlight the cursor cell with reversed colors for visibility
+                    // This clearly shows where the next character will be inserted
+                    let cursor_style = pager.theme.cursor();
+                    if let Some(cell) = frame.buffer_mut().cell_mut(Position::new(screen_x, screen_y)) {
+                        cell.set_style(cursor_style);
+                    }
+
+                    // Also set terminal cursor position for native cursor blinking
                     frame.set_cursor_position(Position::new(screen_x, screen_y));
                 }
             }
