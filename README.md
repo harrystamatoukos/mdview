@@ -2,6 +2,8 @@
 
 A beautiful terminal markdown viewer with editorial aesthetics. Designed for **reading**, not coding.
 
+> **Learning Project**: This project exists primarily as a hands-on way to learn Rust and terminal programming (TUI with ratatui, raw mode, escape sequences, etc.). It's a real, usable tool — but also a playground for understanding how terminals actually work under the hood.
+
 ## Philosophy
 
 Most markdown viewers feel like code editors. mdview takes a different approach:
