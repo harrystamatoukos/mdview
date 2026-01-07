@@ -1,4 +1,7 @@
-use crate::parser::{self, Element, Span};
+use std::borrow::Cow;
+
+use crate::parser::{self, Element, Span, SpanKind};
+use crate::position::{LayoutMap, MappedChar};
 use crate::theme::{
     Theme, OPTIMAL_WIDTH, LEFT_MARGIN, MIN_MARGIN, TOP_PADDING,
     HEADING_SPACING_MAJOR, HEADING_SPACING_MINOR, SECTION_SPACING,
@@ -6,6 +9,56 @@ use crate::theme::{
     TABLE_LABEL_MAX_WIDTH, TABLE_CARD_THRESHOLD,
 };
 use ratatui::text::{Line, Span as TuiSpan, Text};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAPPED LINE BUILDER - Builds visual line + position mapping simultaneously
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Builder for a single rendered line with position tracking
+struct MappedLineBuilder {
+    spans: Vec<TuiSpan<'static>>,
+    chars: Vec<MappedChar>,
+}
+
+impl MappedLineBuilder {
+    fn new() -> Self {
+        Self {
+            spans: Vec::new(),
+            chars: Vec::new(),
+        }
+    }
+
+    /// Add synthetic (no source position) content
+    fn push_synthetic(&mut self, text: &str, style: ratatui::style::Style) {
+        for ch in text.chars() {
+            self.chars.push(MappedChar::synthetic(ch));
+        }
+        self.spans.push(TuiSpan::styled(text.to_string(), style));
+    }
+
+    /// Add synthetic content with raw (default) style
+    fn push_synthetic_raw(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.chars.push(MappedChar::synthetic(ch));
+        }
+        self.spans.push(TuiSpan::raw(text.to_string()));
+    }
+
+    /// Add content with source position tracking
+    fn push_mapped(&mut self, text: &str, start_offset: usize, style: ratatui::style::Style) {
+        let mut offset = start_offset;
+        for ch in text.chars() {
+            self.chars.push(MappedChar::with_source(ch, offset));
+            offset += ch.len_utf8();
+        }
+        self.spans.push(TuiSpan::styled(text.to_string(), style));
+    }
+
+    /// Finish and return (Line, MappedChars)
+    fn finish(self) -> (Line<'static>, Vec<MappedChar>) {
+        (Line::from(self.spans), self.chars)
+    }
+}
 
 /// Render markdown content to plain text (for --print mode)
 pub fn render(content: &str) -> String {
@@ -59,6 +112,562 @@ pub fn render_to_text(content: &str, terminal_width: u16, theme: &Theme) -> Text
     Text::from(lines)
 }
 
+/// Render markdown to ratatui Text WITH position mapping for WYSIWYG editing
+/// Returns both the visual Text and a LayoutMap for cursor navigation
+pub fn render_to_text_mapped(content: &str, terminal_width: u16, theme: &Theme) -> (Text<'static>, LayoutMap) {
+    let elements = parser::parse(content);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut layout_map = LayoutMap::new(content.len());
+
+    // Calculate centering: how much left margin to add
+    let content_width = OPTIMAL_WIDTH.min(terminal_width as usize - LEFT_MARGIN);
+    let left_margin = if terminal_width as usize > content_width + LEFT_MARGIN {
+        (terminal_width as usize - content_width) / 2
+    } else {
+        MIN_MARGIN
+    };
+    let margin = " ".repeat(left_margin);
+
+    // Top padding - like a book page (synthetic - no source positions)
+    for _ in 0..TOP_PADDING {
+        lines.push(Line::from(""));
+        layout_map.push_line(Vec::new());
+    }
+
+    for element in elements {
+        render_element_mapped(&element, &mut lines, &mut layout_map, &margin, content_width, theme);
+    }
+
+    // End of document marker - synthetic
+    for _ in 0..TOP_PADDING {
+        lines.push(Line::from(""));
+        layout_map.push_line(Vec::new());
+    }
+    let end_marker_margin = " ".repeat(left_margin + content_width / 2 - 4);
+    let mut builder = MappedLineBuilder::new();
+    builder.push_synthetic_raw(&end_marker_margin);
+    builder.push_synthetic("· · ·", theme.hr());
+    let (line, chars) = builder.finish();
+    lines.push(line);
+    layout_map.push_line(chars);
+
+    for _ in 0..TOP_PADDING {
+        lines.push(Line::from(""));
+        layout_map.push_line(Vec::new());
+    }
+
+    // Build index for fast lookups
+    layout_map.build_index();
+
+    (Text::from(lines), layout_map)
+}
+
+/// Render element with position mapping
+fn render_element_mapped(
+    element: &Element,
+    lines: &mut Vec<Line<'static>>,
+    layout_map: &mut LayoutMap,
+    margin: &str,
+    width: usize,
+    theme: &Theme,
+) {
+    match element {
+        Element::Heading { level, text, source } => {
+            // Spacing above (synthetic)
+            let spacing_above = if *level <= 2 { HEADING_SPACING_MAJOR } else { HEADING_SPACING_MINOR };
+            for _ in 0..spacing_above {
+                lines.push(Line::from(""));
+                layout_map.push_line(Vec::new());
+            }
+
+            let style = match level {
+                1 => theme.h1(),
+                2 => theme.h2(),
+                3 => theme.h3(),
+                4 => theme.h4(),
+                5 => theme.h5(),
+                _ => theme.h6(),
+            };
+
+            let mut builder = MappedLineBuilder::new();
+            builder.push_synthetic_raw(margin);
+
+            // For H1, we uppercase - chars still map to source but display is uppercase
+            // Use Cow to avoid allocation for non-H1 headings
+            let text_to_render: Cow<str> = if *level == 1 {
+                Cow::Owned(text.to_uppercase())
+            } else {
+                Cow::Borrowed(text)
+            };
+
+            // Calculate offset to actual heading text (skip markdown syntax)
+            // ATX headings: "# ", "## ", "### " etc. = level + 1 characters
+            // The source span starts at the first #, text starts after "### "
+            let text_start_offset = source.start + (*level as usize) + 1;
+            builder.push_mapped(&text_to_render, text_start_offset, style);
+
+            let (line, chars) = builder.finish();
+            lines.push(line);
+            layout_map.push_line(chars);
+
+            // Spacing below (synthetic)
+            if *level == 1 {
+                lines.push(Line::from(""));
+                layout_map.push_line(Vec::new());
+            }
+            lines.push(Line::from(""));
+            layout_map.push_line(Vec::new());
+        }
+
+        Element::Paragraph { spans, source } => {
+            // Render spans with position tracking and word wrap
+            let wrapped_lines = wrap_spans_mapped(spans, width, source.start);
+
+            for (wrapped_text, char_offsets) in wrapped_lines {
+                let mut builder = MappedLineBuilder::new();
+                builder.push_synthetic_raw(margin);
+
+                // Add each character with its mapped position
+                let style = theme.body();
+                for (ch, maybe_offset) in wrapped_text.chars().zip(char_offsets.iter()) {
+                    if let Some(offset) = maybe_offset {
+                        builder.chars.push(MappedChar::with_source(ch, *offset));
+                    } else {
+                        builder.chars.push(MappedChar::synthetic(ch));
+                    }
+                }
+                builder.spans.push(TuiSpan::styled(wrapped_text, style));
+
+                let (line, chars) = builder.finish();
+                lines.push(line);
+                layout_map.push_line(chars);
+            }
+
+            // Paragraph spacing
+            lines.push(Line::from(""));
+            layout_map.push_line(Vec::new());
+        }
+
+        Element::CodeBlock { language, code, source } => {
+            lines.push(Line::from(""));
+            layout_map.push_line(Vec::new());
+
+            let lang_label = language.as_deref().unwrap_or("");
+
+            // Top border (synthetic)
+            let mut builder = MappedLineBuilder::new();
+            builder.push_synthetic_raw(margin);
+            builder.push_synthetic(&format!("    ╭─ {} ", lang_label), theme.code_border());
+            builder.push_synthetic(&"─".repeat(width.saturating_sub(10 + lang_label.len())), theme.code_border());
+            let (line, chars) = builder.finish();
+            lines.push(line);
+            layout_map.push_line(chars);
+
+            // Calculate where actual code content starts (after opening fence line)
+            // Fenced code blocks: "```" + language (if any) + "\n"
+            let fence_line_len = 3 + language.as_ref().map(|l| l.len()).unwrap_or(0) + 1;
+            let mut current_offset = source.start + fence_line_len;
+
+            for code_line in code.lines() {
+                let mut builder = MappedLineBuilder::new();
+                builder.push_synthetic_raw(margin);
+                builder.push_synthetic("    │ ", theme.code_border());
+                builder.push_mapped(code_line, current_offset, theme.code_block());
+                let (line, chars) = builder.finish();
+                lines.push(line);
+                layout_map.push_line(chars);
+
+                current_offset += code_line.len() + 1; // +1 for newline
+            }
+
+            // Bottom border (synthetic)
+            let mut builder = MappedLineBuilder::new();
+            builder.push_synthetic_raw(margin);
+            builder.push_synthetic(&format!("    ╰{}─", "─".repeat(width.saturating_sub(8))), theme.code_border());
+            let (line, chars) = builder.finish();
+            lines.push(line);
+            layout_map.push_line(chars);
+
+            lines.push(Line::from(""));
+            layout_map.push_line(Vec::new());
+        }
+
+        Element::BlockQuote { elements, .. } => {
+            lines.push(Line::from(""));
+            layout_map.push_line(Vec::new());
+
+            // Recursively render blockquote content
+            for el in elements {
+                let mut quote_lines: Vec<Line<'static>> = Vec::new();
+                let mut quote_map = LayoutMap::new(0);
+                render_element_mapped(el, &mut quote_lines, &mut quote_map, "", width.saturating_sub(BLOCKQUOTE_WIDTH_REDUCTION), theme);
+
+                // Add blockquote border to each line
+                for (i, line) in quote_lines.into_iter().enumerate() {
+                    let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    let quote_chars = quote_map.line(i).map(|s| s.to_vec()).unwrap_or_default();
+
+                    let mut builder = MappedLineBuilder::new();
+                    builder.push_synthetic_raw(margin);
+
+                    if content.trim().is_empty() {
+                        builder.push_synthetic("    │", theme.blockquote_border());
+                    } else {
+                        builder.push_synthetic("    │ ", theme.blockquote_border());
+                        // Transfer the mapped chars from the nested rendering
+                        builder.chars.extend(quote_chars);
+                        builder.spans.push(TuiSpan::styled(content.trim().to_string(), theme.blockquote()));
+                    }
+                    let (line, chars) = builder.finish();
+                    lines.push(line);
+                    layout_map.push_line(chars);
+                }
+            }
+
+            lines.push(Line::from(""));
+            layout_map.push_line(Vec::new());
+        }
+
+        Element::List { ordered, start, items, .. } => {
+            for (i, item) in items.iter().enumerate() {
+                let marker = if *ordered {
+                    format!("  {}. ", start.unwrap_or(1) + i as u64)
+                } else {
+                    "  •  ".to_string()
+                };
+
+                let marker_width = marker.chars().count();
+                let text_width = width.saturating_sub(marker_width);
+
+                // Use wrap_spans_mapped to preserve source positions from each span
+                // (same approach as Paragraph - each span has correct source.start)
+                let wrapped_lines = wrap_spans_mapped(&item.spans, text_width, 0);
+
+                for (j, (wrapped_text, char_offsets)) in wrapped_lines.iter().enumerate() {
+                    let mut builder = MappedLineBuilder::new();
+                    builder.push_synthetic_raw(margin);
+
+                    if j == 0 {
+                        builder.push_synthetic(&marker, theme.list_marker());
+                    } else {
+                        builder.push_synthetic_raw(&" ".repeat(marker_width));
+                    }
+
+                    // Add each character with its source mapping from spans
+                    let style = theme.body();
+                    for (ch, maybe_offset) in wrapped_text.chars().zip(char_offsets.iter()) {
+                        if let Some(offset) = maybe_offset {
+                            builder.chars.push(MappedChar::with_source(ch, *offset));
+                        } else {
+                            builder.chars.push(MappedChar::synthetic(ch));
+                        }
+                    }
+                    builder.spans.push(TuiSpan::styled(wrapped_text.clone(), style));
+
+                    let (line, chars) = builder.finish();
+                    lines.push(line);
+                    layout_map.push_line(chars);
+                }
+
+                // Handle nested lists recursively
+                if let Some(nested) = &item.nested {
+                    let nested_margin = format!("{}{}", margin, " ".repeat(NESTED_LIST_INDENT));
+                    render_element_mapped(nested, lines, layout_map, &nested_margin, width.saturating_sub(NESTED_LIST_INDENT), theme);
+                }
+            }
+            lines.push(Line::from(""));
+            layout_map.push_line(Vec::new());
+        }
+
+        Element::HorizontalRule { .. } => {
+            for _ in 0..SECTION_SPACING {
+                lines.push(Line::from(""));
+                layout_map.push_line(Vec::new());
+            }
+
+            let rule_margin = " ".repeat(margin.len() + width / 4);
+            let mut builder = MappedLineBuilder::new();
+            builder.push_synthetic_raw(&rule_margin);
+            builder.push_synthetic("─  ·  ─", theme.hr());
+            let (line, chars) = builder.finish();
+            lines.push(line);
+            layout_map.push_line(chars);
+
+            for _ in 0..SECTION_SPACING {
+                lines.push(Line::from(""));
+                layout_map.push_line(Vec::new());
+            }
+        }
+
+        Element::Table { headers, rows, .. } => {
+            // For now, tables are rendered without fine-grained position mapping
+            // (complex due to column alignment) - treat as mostly synthetic
+            lines.push(Line::from(""));
+            layout_map.push_line(Vec::new());
+
+            let natural_widths: Vec<usize> = headers
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    let header_len = h.chars().count();
+                    let max_row = rows
+                        .iter()
+                        .map(|r| r.get(i).map(|c| c.chars().count()).unwrap_or(0))
+                        .max()
+                        .unwrap_or(0);
+                    header_len.max(max_row)
+                })
+                .collect();
+
+            let natural_total: usize = natural_widths.iter().sum::<usize>() + (headers.len() - 1) * 3 + 4;
+
+            if natural_total <= width {
+                render_table_tabular_mapped(lines, layout_map, margin, headers, rows, &natural_widths, theme);
+            } else {
+                render_table_cards_mapped(lines, layout_map, margin, headers, rows, width, theme);
+            }
+
+            lines.push(Line::from(""));
+            layout_map.push_line(Vec::new());
+        }
+    }
+}
+
+/// Word wrap spans while preserving source positions (including spaces)
+fn wrap_spans_mapped(spans: &[Span], width: usize, _base_offset: usize) -> Vec<(String, Vec<Option<usize>>)> {
+    if width == 0 {
+        return vec![(String::new(), Vec::new())];
+    }
+
+    let mut result: Vec<(String, Vec<Option<usize>>)> = Vec::new();
+    let mut current_line = String::new();
+    let mut current_offsets: Vec<Option<usize>> = Vec::new();
+    let mut current_len = 0;
+
+    // Collect all characters with their source offsets first
+    let mut all_chars: Vec<(char, Option<usize>)> = Vec::new();
+
+    for span in spans {
+        let (text, span_start, is_synthetic) = match &span.kind {
+            SpanKind::Text(t) => (t.clone(), span.source.start, false),
+            SpanKind::Emphasis(t) => (t.clone(), span.source.start, false),
+            SpanKind::Strong(t) => (t.clone(), span.source.start, false),
+            SpanKind::StrongEmphasis(t) => (t.clone(), span.source.start, false),
+            SpanKind::Code(t) => (format!("‹{}›", t), span.source.start, true), // Brackets are synthetic
+            SpanKind::Link { text, url } => (format!("{} [→ {}]", text, url), span.source.start, true),
+            SpanKind::Strikethrough(t) => (t.clone(), span.source.start, false),
+            SpanKind::SoftBreak => (" ".to_string(), span.source.start, false),
+            SpanKind::HardBreak => ("\n".to_string(), span.source.start, false),
+        };
+
+        if is_synthetic {
+            // For synthetic content (like code brackets), map all chars to span start
+            for ch in text.chars() {
+                all_chars.push((ch, Some(span_start)));
+            }
+        } else {
+            // Map each character to its source position
+            let mut byte_offset = 0;
+            for ch in text.chars() {
+                all_chars.push((ch, Some(span_start + byte_offset)));
+                byte_offset += ch.len_utf8();
+            }
+        }
+    }
+
+    // Now do word wrapping while preserving positions
+    let mut i = 0;
+
+    while i < all_chars.len() {
+        let (ch, offset) = all_chars[i];
+
+        if ch == '\n' {
+            // Hard break - start new line
+            result.push((current_line, current_offsets));
+            current_line = String::new();
+            current_offsets = Vec::new();
+            current_len = 0;
+            i += 1;
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            // Handle whitespace - check if we need to wrap before adding
+            if current_len > 0 {
+                // Look ahead to see the next word length
+                let next_word_len = count_next_word_len(&all_chars, i + 1);
+
+                if current_len + 1 + next_word_len > width && next_word_len > 0 {
+                    // Wrap before adding space
+                    result.push((current_line, current_offsets));
+                    current_line = String::new();
+                    current_offsets = Vec::new();
+                    current_len = 0;
+                    // Skip the space at line break
+                    i += 1;
+                    continue;
+                }
+
+                // Add the space with its source mapping
+                current_line.push(' ');
+                current_offsets.push(offset);
+                current_len += 1;
+            }
+            i += 1;
+        } else {
+            // Regular character
+            current_line.push(ch);
+            current_offsets.push(offset);
+            current_len += 1;
+            i += 1;
+        }
+    }
+
+    if !current_line.is_empty() || result.is_empty() {
+        result.push((current_line, current_offsets));
+    }
+
+    result
+}
+
+/// Count the length of the next word (non-whitespace sequence)
+fn count_next_word_len(chars: &[(char, Option<usize>)], start: usize) -> usize {
+    let mut len = 0;
+    for i in start..chars.len() {
+        let (ch, _) = chars[i];
+        if ch.is_whitespace() {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+/// Render table in tabular format with position mapping
+fn render_table_tabular_mapped(
+    lines: &mut Vec<Line<'static>>,
+    layout_map: &mut LayoutMap,
+    margin: &str,
+    headers: &[String],
+    rows: &[Vec<String>],
+    col_widths: &[usize],
+    theme: &Theme,
+) {
+    let total_width: usize = col_widths.iter().sum::<usize>() + (headers.len() - 1) * 3 + 4;
+
+    // Top border
+    let mut builder = MappedLineBuilder::new();
+    builder.push_synthetic_raw(margin);
+    builder.push_synthetic(&format!("  ┌{}┐", "─".repeat(total_width - 2)), theme.table_border());
+    let (line, chars) = builder.finish();
+    lines.push(line);
+    layout_map.push_line(chars);
+
+    // Header row
+    let mut builder = MappedLineBuilder::new();
+    builder.push_synthetic_raw(margin);
+    builder.push_synthetic("  │", theme.table_border());
+    for (i, h) in headers.iter().enumerate() {
+        let w = col_widths[i];
+        builder.push_synthetic(&format!(" {:<width$}", h, width = w), theme.table_header());
+        if i < headers.len() - 1 {
+            builder.push_synthetic(" │", theme.table_border());
+        }
+    }
+    builder.push_synthetic(" │", theme.table_border());
+    let (line, chars) = builder.finish();
+    lines.push(line);
+    layout_map.push_line(chars);
+
+    // Separator
+    let sep_parts: Vec<String> = col_widths.iter().map(|w| "─".repeat(*w + 2)).collect();
+    let mut builder = MappedLineBuilder::new();
+    builder.push_synthetic_raw(margin);
+    builder.push_synthetic(&format!("  ├{}┤", sep_parts.join("┼")), theme.table_border());
+    let (line, chars) = builder.finish();
+    lines.push(line);
+    layout_map.push_line(chars);
+
+    // Data rows
+    for row in rows {
+        let mut builder = MappedLineBuilder::new();
+        builder.push_synthetic_raw(margin);
+        builder.push_synthetic("  │", theme.table_border());
+        for (i, c) in row.iter().enumerate() {
+            let w = col_widths.get(i).copied().unwrap_or(10);
+            builder.push_synthetic(&format!(" {:<width$}", c, width = w), theme.body());
+            if i < row.len() - 1 {
+                builder.push_synthetic(" │", theme.table_border());
+            }
+        }
+        builder.push_synthetic(" │", theme.table_border());
+        let (line, chars) = builder.finish();
+        lines.push(line);
+        layout_map.push_line(chars);
+    }
+
+    // Bottom border
+    let mut builder = MappedLineBuilder::new();
+    builder.push_synthetic_raw(margin);
+    builder.push_synthetic(&format!("  └{}┘", "─".repeat(total_width - 2)), theme.table_border());
+    let (line, chars) = builder.finish();
+    lines.push(line);
+    layout_map.push_line(chars);
+}
+
+/// Render table as cards with position mapping
+fn render_table_cards_mapped(
+    lines: &mut Vec<Line<'static>>,
+    layout_map: &mut LayoutMap,
+    margin: &str,
+    headers: &[String],
+    rows: &[Vec<String>],
+    width: usize,
+    theme: &Theme,
+) {
+    let max_header_len = headers.iter().map(|h| h.chars().count()).max().unwrap_or(10);
+    let label_width = max_header_len.min(TABLE_LABEL_MAX_WIDTH);
+    let value_width = width.saturating_sub(label_width + BLOCKQUOTE_WIDTH_REDUCTION);
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        if row_idx > 0 {
+            lines.push(Line::from(""));
+            layout_map.push_line(Vec::new());
+        }
+
+        // Card header
+        let separator_width = width.saturating_sub(8);
+        let mut builder = MappedLineBuilder::new();
+        builder.push_synthetic_raw(margin);
+        builder.push_synthetic(&format!("  ─── {} ", row_idx + 1), theme.table_border());
+        builder.push_synthetic(&"─".repeat(separator_width), theme.table_border());
+        let (line, chars) = builder.finish();
+        lines.push(line);
+        layout_map.push_line(chars);
+
+        // Fields
+        for (i, header) in headers.iter().enumerate() {
+            let value = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            let value_lines = wrap_text(value, value_width);
+
+            for (line_idx, value_line) in value_lines.iter().enumerate() {
+                let mut builder = MappedLineBuilder::new();
+                builder.push_synthetic_raw(margin);
+                if line_idx == 0 {
+                    builder.push_synthetic(&format!("  {:<width$}", header, width = label_width), theme.table_header());
+                    builder.push_synthetic("  ", theme.body());
+                } else {
+                    builder.push_synthetic_raw(&" ".repeat(label_width + 4));
+                }
+                builder.push_synthetic(value_line, theme.body());
+                let (line, chars) = builder.finish();
+                lines.push(line);
+                layout_map.push_line(chars);
+            }
+        }
+    }
+}
+
 fn render_element_to_lines(
     element: &Element,
     lines: &mut Vec<Line<'static>>,
@@ -67,7 +676,7 @@ fn render_element_to_lines(
     theme: &Theme,
 ) {
     match element {
-        Element::Heading { level, text } => {
+        Element::Heading { level, text, .. } => {
             // Major headers (H1/H2) get more spacing than minor headers
             let spacing_above = if *level <= 2 { HEADING_SPACING_MAJOR } else { HEADING_SPACING_MINOR };
             for _ in 0..spacing_above {
@@ -106,7 +715,7 @@ fn render_element_to_lines(
             lines.push(Line::from(""));
         }
 
-        Element::Paragraph { spans } => {
+        Element::Paragraph { spans, .. } => {
             let text = render_spans_to_string(spans);
 
             // Word wrap to content width
@@ -121,7 +730,7 @@ fn render_element_to_lines(
             lines.push(Line::from(""));
         }
 
-        Element::CodeBlock { language, code } => {
+        Element::CodeBlock { language, code, .. } => {
             lines.push(Line::from(""));
 
             let lang_label = language.as_deref().unwrap_or("");
@@ -151,7 +760,7 @@ fn render_element_to_lines(
             lines.push(Line::from(""));
         }
 
-        Element::BlockQuote { elements } => {
+        Element::BlockQuote { elements, .. } => {
             lines.push(Line::from(""));
 
             // Render blockquote content with left bar
@@ -179,7 +788,7 @@ fn render_element_to_lines(
             lines.push(Line::from(""));
         }
 
-        Element::List { ordered, start, items } => {
+        Element::List { ordered, start, items, .. } => {
             for (i, item) in items.iter().enumerate() {
                 let marker = if *ordered {
                     format!("  {}. ", start.unwrap_or(1) + i as u64)
@@ -217,7 +826,7 @@ fn render_element_to_lines(
             lines.push(Line::from(""));
         }
 
-        Element::HorizontalRule => {
+        Element::HorizontalRule { .. } => {
             for _ in 0..SECTION_SPACING {
                 lines.push(Line::from(""));
             }
@@ -231,7 +840,7 @@ fn render_element_to_lines(
             }
         }
 
-        Element::Table { headers, rows } => {
+        Element::Table { headers, rows, .. } => {
             lines.push(Line::from(""));
 
             // Calculate natural column widths (no truncation)
@@ -409,18 +1018,19 @@ fn render_table_cards(
 }
 
 fn render_spans_to_string(spans: &[Span]) -> String {
+    use crate::parser::SpanKind;
     spans
         .iter()
-        .map(|span| match span {
-            Span::Text(t) => t.clone(),
-            Span::Emphasis(t) => t.clone(),
-            Span::Strong(t) => t.clone(),
-            Span::StrongEmphasis(t) => t.clone(),
-            Span::Code(t) => format!("‹{}›", t),  // Subtle code markers
-            Span::Link { text, url } => format!("{} [→ {}]", text, url),
-            Span::Strikethrough(t) => t.clone(),
-            Span::SoftBreak => " ".to_string(),
-            Span::HardBreak => "\n".to_string(),
+        .map(|span| match &span.kind {
+            SpanKind::Text(t) => t.clone(),
+            SpanKind::Emphasis(t) => t.clone(),
+            SpanKind::Strong(t) => t.clone(),
+            SpanKind::StrongEmphasis(t) => t.clone(),
+            SpanKind::Code(t) => format!("‹{}›", t),  // Subtle code markers
+            SpanKind::Link { text, url } => format!("{} [→ {}]", text, url),
+            SpanKind::Strikethrough(t) => t.clone(),
+            SpanKind::SoftBreak => " ".to_string(),
+            SpanKind::HardBreak => "\n".to_string(),
         })
         .collect()
 }
@@ -464,7 +1074,7 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
     let margin = " ".repeat(indent + LEFT_MARGIN);
 
     match element {
-        Element::Heading { level, text } => {
+        Element::Heading { level, text, .. } => {
             let spacing = if *level <= 2 {
                 "\n".repeat(HEADING_SPACING_MAJOR)
             } else {
@@ -476,7 +1086,7 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
                 format!("{}{}{}\n\n", spacing, margin, text)
             }
         }
-        Element::Paragraph { spans } => {
+        Element::Paragraph { spans, .. } => {
             let text = render_spans_to_string(spans);
             let wrapped: Vec<String> = wrap_text(&text, OPTIMAL_WIDTH)
                 .iter()
@@ -484,7 +1094,7 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
                 .collect();
             format!("{}\n\n", wrapped.join("\n"))
         }
-        Element::CodeBlock { language, code } => {
+        Element::CodeBlock { language, code, .. } => {
             let lang = language.as_deref().unwrap_or("");
             let border_width = OPTIMAL_WIDTH.saturating_sub(lang.len() + 5);
             let mut output = format!("\n{}╭─ {} {}\n", margin, lang, "─".repeat(border_width));
@@ -494,7 +1104,7 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
             output.push_str(&format!("{}╰{}\n\n", margin, "─".repeat(OPTIMAL_WIDTH.saturating_sub(3))));
             output
         }
-        Element::BlockQuote { elements } => {
+        Element::BlockQuote { elements, .. } => {
             let mut output = String::from("\n");
             for el in elements {
                 let rendered = render_element_plain(el, indent);
@@ -505,7 +1115,7 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
             output.push('\n');
             output
         }
-        Element::List { ordered, start, items } => {
+        Element::List { ordered, start, items, .. } => {
             let mut output = String::new();
             for (i, item) in items.iter().enumerate() {
                 let marker = if *ordered {
@@ -523,7 +1133,7 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
             output.push('\n');
             output
         }
-        Element::HorizontalRule => {
+        Element::HorizontalRule { .. } => {
             let hr_margin = " ".repeat(indent + OPTIMAL_WIDTH / 4);
             format!(
                 "{}\n{}─  ·  ─\n{}\n",
@@ -532,7 +1142,7 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
                 "\n".repeat(SECTION_SPACING)
             )
         }
-        Element::Table { headers, rows } => {
+        Element::Table { headers, rows, .. } => {
             let mut output = String::from("\n");
 
             // Calculate natural column widths

@@ -2,9 +2,12 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 
+mod editor;
 mod parser;
 mod pager;
+mod position;
 mod renderer;
+mod selection;
 mod theme;
 mod watcher;
 
