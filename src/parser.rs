@@ -6,7 +6,7 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, HeadingLevel, CodeBlockKind};
 use std::ops::Range;
 
-use crate::position::SourceSpan;
+use crate::primitives::SourceSpan;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ELEMENT - Parsed markdown block with source position
@@ -141,7 +141,7 @@ where
             Some(Element::Heading {
                 level: heading_level_to_u8(level),
                 text,
-                source: SourceSpan::new(start, end),
+                source: SourceSpan::from_usize(start, end),
             })
         }
         Event::Start(Tag::Paragraph) => {
@@ -149,20 +149,20 @@ where
             let (spans, end) = collect_spans_until_end_ranged(iter, TagEnd::Paragraph);
             Some(Element::Paragraph {
                 spans,
-                source: SourceSpan::new(start, end),
+                source: SourceSpan::from_usize(start, end),
             })
         }
         Event::Start(Tag::CodeBlock(kind)) => {
             let start = range.start;
             let language = match kind {
-                CodeBlockKind::Fenced(lang) if !lang.is_empty() => Some(lang.to_string()),
+                CodeBlockKind::Fenced(lang) if !lang.is_empty() => Some(lang.into_string()),
                 _ => None,
             };
             let (code, end) = collect_text_until_end_ranged(iter, TagEnd::CodeBlock);
             Some(Element::CodeBlock {
                 language,
                 code,
-                source: SourceSpan::new(start, end),
+                source: SourceSpan::from_usize(start, end),
             })
         }
         Event::Start(Tag::BlockQuote(_)) => {
@@ -186,7 +186,7 @@ where
             }
             Some(Element::BlockQuote {
                 elements: inner_elements,
-                source: SourceSpan::new(start, end),
+                source: SourceSpan::from_usize(start, end),
             })
         }
         Event::Start(Tag::List(start_num)) => {
@@ -197,7 +197,7 @@ where
                 ordered,
                 start: start_num,
                 items,
-                source: SourceSpan::new(start, end),
+                source: SourceSpan::from_usize(start, end),
             })
         }
         Event::Rule => Some(Element::HorizontalRule {
@@ -209,7 +209,7 @@ where
             Some(Element::Table {
                 headers,
                 rows,
-                source: SourceSpan::new(start, end),
+                source: SourceSpan::from_usize(start, end),
             })
         }
         _ => None,
@@ -270,11 +270,13 @@ where
                 break;
             }
             Some((Event::Text(t), range)) => {
+                // Use into_string() to avoid allocation when CowStr is already owned
+                let text = t.into_string();
                 let kind = match emphasis_level {
-                    0 => SpanKind::Text(t.to_string()),
-                    1 => SpanKind::Emphasis(t.to_string()),
-                    2 => SpanKind::Strong(t.to_string()),
-                    _ => SpanKind::StrongEmphasis(t.to_string()),
+                    0 => SpanKind::Text(text),
+                    1 => SpanKind::Emphasis(text),
+                    2 => SpanKind::Strong(text),
+                    _ => SpanKind::StrongEmphasis(text),
                 };
                 spans.push(Span {
                     kind,
@@ -283,7 +285,7 @@ where
             }
             Some((Event::Code(t), range)) => {
                 spans.push(Span {
-                    kind: SpanKind::Code(t.to_string()),
+                    kind: SpanKind::Code(t.into_string()),
                     source: SourceSpan::from_range(range),
                 });
             }
@@ -299,9 +301,9 @@ where
                 spans.push(Span {
                     kind: SpanKind::Link {
                         text,
-                        url: dest_url.to_string(),
+                        url: dest_url.into_string(),
                     },
-                    source: SourceSpan::new(start, end),
+                    source: SourceSpan::from_usize(start, end),
                 });
             }
             Some((Event::SoftBreak, range)) => {
@@ -368,13 +370,13 @@ where
                         }
                         Some((Event::Text(t), range)) => {
                             spans.push(Span {
-                                kind: SpanKind::Text(t.to_string()),
+                                kind: SpanKind::Text(t.into_string()),
                                 source: SourceSpan::from_range(range),
                             });
                         }
                         Some((Event::Code(t), range)) => {
                             spans.push(Span {
-                                kind: SpanKind::Code(t.to_string()),
+                                kind: SpanKind::Code(t.into_string()),
                                 source: SourceSpan::from_range(range),
                             });
                         }
@@ -393,7 +395,7 @@ where
                                 ordered: start.is_some(),
                                 start,
                                 items: sub_items,
-                                source: SourceSpan::new(list_start, list_end),
+                                source: SourceSpan::from_usize(list_start, list_end),
                             }));
                         }
                         Some((Event::SoftBreak, range)) => {
@@ -410,7 +412,7 @@ where
                 items.push(ListItem {
                     spans,
                     nested,
-                    source: SourceSpan::new(item_start, item_end),
+                    source: SourceSpan::from_usize(item_start, item_end),
                 });
             }
             Some((Event::End(TagEnd::List(_)), range)) => {

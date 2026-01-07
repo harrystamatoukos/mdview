@@ -1,14 +1,34 @@
 use std::borrow::Cow;
 
 use crate::parser::{self, Element, Span, SpanKind};
-use crate::position::{LayoutMap, MappedChar};
+use crate::position::{FormattingKind, FormattingSpan, LayoutMap, MappedChar};
 use crate::theme::{
     Theme, OPTIMAL_WIDTH, LEFT_MARGIN, MIN_MARGIN, TOP_PADDING,
     HEADING_SPACING_MAJOR, HEADING_SPACING_MINOR, SECTION_SPACING,
     BLOCKQUOTE_WIDTH_REDUCTION, NESTED_LIST_INDENT,
     TABLE_LABEL_MAX_WIDTH, TABLE_CARD_THRESHOLD,
 };
+use ratatui::style::Style;
 use ratatui::text::{Line, Span as TuiSpan, Text};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STYLED CHARACTER - Tracks char, source position, and styling through wrapping
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A character with its source position and style information
+#[derive(Clone)]
+struct StyledChar {
+    ch: char,
+    source_offset: Option<usize>,
+    style: Style,
+}
+
+/// A segment of styled text with position tracking
+struct StyledSegment {
+    text: String,
+    char_offsets: Vec<Option<usize>>,
+    style: Style,
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MAPPED LINE BUILDER - Builds visual line + position mapping simultaneously
@@ -128,6 +148,9 @@ pub fn render_to_text_mapped(content: &str, terminal_width: u16, theme: &Theme) 
     };
     let margin = " ".repeat(left_margin);
 
+    // Store margin in layout map for cursor positioning on empty lines
+    layout_map.set_content_margin(left_margin);
+
     // Top padding - like a book page (synthetic - no source positions)
     for _ in 0..TOP_PADDING {
         lines.push(Line::from(""));
@@ -203,7 +226,7 @@ fn render_element_mapped(
             // Calculate offset to actual heading text (skip markdown syntax)
             // ATX headings: "# ", "## ", "### " etc. = level + 1 characters
             // The source span starts at the first #, text starts after "### "
-            let text_start_offset = source.start + (*level as usize) + 1;
+            let text_start_offset = source.start.get() + (*level as usize) + 1;
             builder.push_mapped(&text_to_render, text_start_offset, style);
 
             let (line, chars) = builder.finish();
@@ -219,24 +242,30 @@ fn render_element_mapped(
             layout_map.push_line(Vec::new());
         }
 
-        Element::Paragraph { spans, source } => {
-            // Render spans with position tracking and word wrap
-            let wrapped_lines = wrap_spans_mapped(spans, width, source.start);
+        Element::Paragraph { spans, .. } => {
+            // Render spans with position tracking, word wrap, AND style preservation
+            let (wrapped_lines, formatting_spans) = wrap_spans_styled(spans, width, theme);
 
-            for (wrapped_text, char_offsets) in wrapped_lines {
+            // Register formatting spans for boundary-aware editing
+            for fs in formatting_spans {
+                layout_map.push_formatting_span(fs);
+            }
+
+            for segments in wrapped_lines {
                 let mut builder = MappedLineBuilder::new();
                 builder.push_synthetic_raw(margin);
 
-                // Add each character with its mapped position
-                let style = theme.body();
-                for (ch, maybe_offset) in wrapped_text.chars().zip(char_offsets.iter()) {
-                    if let Some(offset) = maybe_offset {
-                        builder.chars.push(MappedChar::with_source(ch, *offset));
-                    } else {
-                        builder.chars.push(MappedChar::synthetic(ch));
+                // Add each segment with its style and position mapping
+                for segment in segments {
+                    for (ch, maybe_offset) in segment.text.chars().zip(segment.char_offsets.iter()) {
+                        if let Some(offset) = maybe_offset {
+                            builder.chars.push(MappedChar::with_source(ch, *offset));
+                        } else {
+                            builder.chars.push(MappedChar::synthetic(ch));
+                        }
                     }
+                    builder.spans.push(TuiSpan::styled(segment.text, segment.style));
                 }
-                builder.spans.push(TuiSpan::styled(wrapped_text, style));
 
                 let (line, chars) = builder.finish();
                 lines.push(line);
@@ -266,7 +295,7 @@ fn render_element_mapped(
             // Calculate where actual code content starts (after opening fence line)
             // Fenced code blocks: "```" + language (if any) + "\n"
             let fence_line_len = 3 + language.as_ref().map(|l| l.len()).unwrap_or(0) + 1;
-            let mut current_offset = source.start + fence_line_len;
+            let mut current_offset = source.start.get() + fence_line_len;
 
             for code_line in code.lines() {
                 let mut builder = MappedLineBuilder::new();
@@ -339,11 +368,15 @@ fn render_element_mapped(
                 let marker_width = marker.chars().count();
                 let text_width = width.saturating_sub(marker_width);
 
-                // Use wrap_spans_mapped to preserve source positions from each span
-                // (same approach as Paragraph - each span has correct source.start)
-                let wrapped_lines = wrap_spans_mapped(&item.spans, text_width, 0);
+                // Use wrap_spans_styled to preserve source positions AND styles
+                let (wrapped_lines, formatting_spans) = wrap_spans_styled(&item.spans, text_width, theme);
 
-                for (j, (wrapped_text, char_offsets)) in wrapped_lines.iter().enumerate() {
+                // Register formatting spans for boundary-aware editing
+                for fs in formatting_spans {
+                    layout_map.push_formatting_span(fs);
+                }
+
+                for (j, segments) in wrapped_lines.iter().enumerate() {
                     let mut builder = MappedLineBuilder::new();
                     builder.push_synthetic_raw(margin);
 
@@ -353,16 +386,17 @@ fn render_element_mapped(
                         builder.push_synthetic_raw(&" ".repeat(marker_width));
                     }
 
-                    // Add each character with its source mapping from spans
-                    let style = theme.body();
-                    for (ch, maybe_offset) in wrapped_text.chars().zip(char_offsets.iter()) {
-                        if let Some(offset) = maybe_offset {
-                            builder.chars.push(MappedChar::with_source(ch, *offset));
-                        } else {
-                            builder.chars.push(MappedChar::synthetic(ch));
+                    // Add each segment with its style and position mapping
+                    for segment in segments {
+                        for (ch, maybe_offset) in segment.text.chars().zip(segment.char_offsets.iter()) {
+                            if let Some(offset) = maybe_offset {
+                                builder.chars.push(MappedChar::with_source(ch, *offset));
+                            } else {
+                                builder.chars.push(MappedChar::synthetic(ch));
+                            }
                         }
+                        builder.spans.push(TuiSpan::styled(segment.text.clone(), segment.style));
                     }
-                    builder.spans.push(TuiSpan::styled(wrapped_text.clone(), style));
 
                     let (line, chars) = builder.finish();
                     lines.push(line);
@@ -434,6 +468,8 @@ fn render_element_mapped(
 }
 
 /// Word wrap spans while preserving source positions (including spaces)
+/// NOTE: Deprecated in favor of wrap_spans_styled which preserves inline formatting
+#[allow(dead_code)]
 fn wrap_spans_mapped(spans: &[Span], width: usize, _base_offset: usize) -> Vec<(String, Vec<Option<usize>>)> {
     if width == 0 {
         return vec![(String::new(), Vec::new())];
@@ -448,16 +484,17 @@ fn wrap_spans_mapped(spans: &[Span], width: usize, _base_offset: usize) -> Vec<(
     let mut all_chars: Vec<(char, Option<usize>)> = Vec::new();
 
     for span in spans {
-        let (text, span_start, is_synthetic) = match &span.kind {
-            SpanKind::Text(t) => (t.clone(), span.source.start, false),
-            SpanKind::Emphasis(t) => (t.clone(), span.source.start, false),
-            SpanKind::Strong(t) => (t.clone(), span.source.start, false),
-            SpanKind::StrongEmphasis(t) => (t.clone(), span.source.start, false),
-            SpanKind::Code(t) => (format!("‹{}›", t), span.source.start, true), // Brackets are synthetic
-            SpanKind::Link { text, url } => (format!("{} [→ {}]", text, url), span.source.start, true),
-            SpanKind::Strikethrough(t) => (t.clone(), span.source.start, false),
-            SpanKind::SoftBreak => (" ".to_string(), span.source.start, false),
-            SpanKind::HardBreak => ("\n".to_string(), span.source.start, false),
+        let span_start = span.source.start.get();
+        let (text, is_synthetic) = match &span.kind {
+            SpanKind::Text(t) => (t.clone(), false),
+            SpanKind::Emphasis(t) => (t.clone(), false),
+            SpanKind::Strong(t) => (t.clone(), false),
+            SpanKind::StrongEmphasis(t) => (t.clone(), false),
+            SpanKind::Code(t) => (format!("‹{}›", t), true), // Brackets are synthetic
+            SpanKind::Link { text, url } => (format!("{} [→ {}]", text, url), true),
+            SpanKind::Strikethrough(t) => (t.clone(), false),
+            SpanKind::SoftBreak => (" ".to_string(), false),
+            SpanKind::HardBreak => ("\n".to_string(), false),
         };
 
         if is_synthetic {
@@ -531,6 +568,7 @@ fn wrap_spans_mapped(spans: &[Span], width: usize, _base_offset: usize) -> Vec<(
 }
 
 /// Count the length of the next word (non-whitespace sequence)
+#[allow(dead_code)]
 fn count_next_word_len(chars: &[(char, Option<usize>)], start: usize) -> usize {
     let mut len = 0;
     for i in start..chars.len() {
@@ -541,6 +579,183 @@ fn count_next_word_len(chars: &[(char, Option<usize>)], start: usize) -> usize {
         len += 1;
     }
     len
+}
+
+/// Count the length of the next word in styled chars
+fn count_next_word_len_styled(chars: &[StyledChar], start: usize) -> usize {
+    let mut len = 0;
+    for i in start..chars.len() {
+        if chars[i].ch.is_whitespace() {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+/// Group consecutive styled chars with the same style into segments
+fn group_styled_chars_into_segments(chars: &[StyledChar]) -> Vec<StyledSegment> {
+    if chars.is_empty() {
+        return Vec::new();
+    }
+
+    // Typically few style changes per line, estimate ~4 segments max
+    let mut segments = Vec::with_capacity(4);
+    let mut current_text = String::with_capacity(chars.len());
+    let mut current_offsets: Vec<Option<usize>> = Vec::with_capacity(chars.len());
+    let mut current_style = chars[0].style;
+
+    for sc in chars {
+        if sc.style == current_style {
+            current_text.push(sc.ch);
+            current_offsets.push(sc.source_offset);
+        } else {
+            // Style changed - finish current segment
+            if !current_text.is_empty() {
+                segments.push(StyledSegment {
+                    text: current_text,
+                    char_offsets: current_offsets,
+                    style: current_style,
+                });
+            }
+            // Start new segment
+            current_text = sc.ch.to_string();
+            current_offsets = vec![sc.source_offset];
+            current_style = sc.style;
+        }
+    }
+
+    // Don't forget the last segment
+    if !current_text.is_empty() {
+        segments.push(StyledSegment {
+            text: current_text,
+            char_offsets: current_offsets,
+            style: current_style,
+        });
+    }
+
+    segments
+}
+
+/// Word wrap spans while preserving source positions AND styles
+/// Returns: (wrapped lines as styled segments, formatting spans for boundary detection)
+fn wrap_spans_styled(spans: &[Span], width: usize, theme: &Theme) -> (Vec<Vec<StyledSegment>>, Vec<FormattingSpan>) {
+    if width == 0 {
+        return (vec![vec![StyledSegment {
+            text: String::new(),
+            char_offsets: Vec::new(),
+            style: Style::default(),
+        }]], Vec::new());
+    }
+
+    // Estimate capacity from source spans to reduce reallocations
+    let estimated_chars: usize = spans.iter().map(|s| s.source.end - s.source.start).sum();
+    let mut all_chars: Vec<StyledChar> = Vec::with_capacity(estimated_chars);
+    // Most spans won't have formatting, but pre-allocate a small amount
+    let mut formatting_spans: Vec<FormattingSpan> = Vec::with_capacity(spans.len() / 4);
+
+    for span in spans {
+        let span_start = span.source.start.get();
+        let span_end = span.source.end.get();
+        let (text, style, formatting_kind) = match &span.kind {
+            SpanKind::Text(t) => (t.clone(), theme.body(), None),
+            SpanKind::Emphasis(t) => (t.clone(), theme.emphasis(), Some(FormattingKind::Emphasis)),
+            SpanKind::Strong(t) => (t.clone(), theme.strong(), Some(FormattingKind::Strong)),
+            SpanKind::StrongEmphasis(t) => (t.clone(), theme.strong_emphasis(), Some(FormattingKind::StrongEmphasis)),
+            SpanKind::Code(t) => (t.clone(), theme.inline_code(), Some(FormattingKind::Code)),
+            SpanKind::Link { text, url } => {
+                // Links: styled text + dim URL
+                let link_text = format!("{} [→ {}]", text, url);
+                (link_text, theme.link(), None) // Links don't have simple markers
+            }
+            SpanKind::Strikethrough(t) => (t.clone(), theme.strikethrough(), Some(FormattingKind::Strikethrough)),
+            SpanKind::SoftBreak => (" ".to_string(), theme.body(), None),
+            SpanKind::HardBreak => ("\n".to_string(), theme.body(), None),
+        };
+
+        // Track formatting spans for boundary-aware editing
+        if let Some(kind) = formatting_kind {
+            formatting_spans.push(FormattingSpan::from_content_range(
+                kind,
+                span_start,
+                span_end,
+            ));
+        }
+
+        // For links, all chars map to span start (synthetic-ish)
+        let is_link = matches!(&span.kind, SpanKind::Link { .. });
+
+        // Map each character to its source position
+        let mut byte_offset = 0;
+        for ch in text.chars() {
+            let source_offset = if is_link {
+                Some(span_start) // Links map all to start
+            } else {
+                Some(span_start + byte_offset)
+            };
+            all_chars.push(StyledChar {
+                ch,
+                source_offset,
+                style,
+            });
+            byte_offset += ch.len_utf8();
+        }
+    }
+
+    // Now do word wrapping while preserving styles
+    // Estimate lines based on total chars / width
+    let estimated_lines = (all_chars.len() / width.max(1)).max(1);
+    let mut result: Vec<Vec<StyledSegment>> = Vec::with_capacity(estimated_lines);
+    let mut current_line: Vec<StyledChar> = Vec::with_capacity(width);
+    let mut current_len = 0;
+    let mut i = 0;
+
+    while i < all_chars.len() {
+        let sc = &all_chars[i];
+
+        if sc.ch == '\n' {
+            // Hard break - start new line
+            result.push(group_styled_chars_into_segments(&current_line));
+            current_line = Vec::with_capacity(width);
+            current_len = 0;
+            i += 1;
+            continue;
+        }
+
+        if sc.ch.is_whitespace() {
+            // Handle whitespace - check if we need to wrap before adding
+            if current_len > 0 {
+                // Look ahead to see the next word length
+                let next_word_len = count_next_word_len_styled(&all_chars, i + 1);
+
+                if current_len + 1 + next_word_len > width && next_word_len > 0 {
+                    // Wrap before adding space
+                    result.push(group_styled_chars_into_segments(&current_line));
+                    current_line = Vec::with_capacity(width);
+                    current_len = 0;
+                    // Skip the space at line break
+                    i += 1;
+                    continue;
+                }
+
+                // Add the space
+                current_line.push(sc.clone());
+                current_len += 1;
+            }
+            i += 1;
+        } else {
+            // Regular character
+            current_line.push(sc.clone());
+            current_len += 1;
+            i += 1;
+        }
+    }
+
+    if !current_line.is_empty() || result.is_empty() {
+        result.push(group_styled_chars_into_segments(&current_line));
+    }
+
+    (result, formatting_spans)
 }
 
 /// Render table in tabular format with position mapping
