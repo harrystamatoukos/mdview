@@ -9,7 +9,7 @@
 //! borders, list bullets) with no source position.
 
 // Re-export types from primitives (single source of truth)
-pub use crate::primitives::{ByteOffset, SourceSpan};
+pub use crate::primitives::{ByteOffset, ScreenPos, SourceSpan};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // FORMATTING SPAN - Tracks inline formatting markers in source
@@ -351,7 +351,7 @@ impl LayoutMap {
     /// Get screen position for a source offset
     /// Uses binary search for O(log n) lookup. Respects content margin for empty lines.
     #[inline]
-    pub fn source_to_screen(&self, offset: ByteOffset) -> Option<(usize, usize)> {
+    pub fn source_to_screen(&self, offset: ByteOffset) -> Option<ScreenPos> {
         if !self.index_built || self.offset_index.is_empty() {
             return self.source_to_screen_linear(offset);
         }
@@ -360,7 +360,7 @@ impl LayoutMap {
             // Exact match - return the position directly
             Ok(idx) => {
                 let (_, line, col) = self.offset_index[idx];
-                Some((line, col))
+                Some(ScreenPos::new(line, col))
             }
 
             // No exact match - cursor is between mapped positions
@@ -369,7 +369,7 @@ impl LayoutMap {
                 let (prev_offset, prev_line, prev_col) = if idx > 0 {
                     self.offset_index[idx - 1]
                 } else {
-                    return Some((0, self.content_margin));
+                    return Some(ScreenPos::new(0, self.content_margin));
                 };
 
                 // Check distance from previous position
@@ -379,7 +379,7 @@ impl LayoutMap {
                 // advance cursor on the same line
                 if distance <= 3 {
                     let new_col = prev_col + distance;
-                    return Some((prev_line, new_col));
+                    return Some(ScreenPos::new(prev_line, new_col));
                 }
 
                 // Cursor is far from previous content - likely in paragraph break (after Enter)
@@ -390,13 +390,13 @@ impl LayoutMap {
                     prev_line
                 };
 
-                Some((target_line, self.content_margin))
+                Some(ScreenPos::new(target_line, self.content_margin))
             }
         }
     }
 
     /// Linear search fallback for source-to-screen (used before index built)
-    fn source_to_screen_linear(&self, offset: ByteOffset) -> Option<(usize, usize)> {
+    fn source_to_screen_linear(&self, offset: ByteOffset) -> Option<ScreenPos> {
         let mut best: Option<(usize, usize, usize)> = None; // (line, col, offset_diff)
 
         for (line_idx, line) in self.lines.iter().enumerate() {
@@ -405,7 +405,7 @@ impl LayoutMap {
 
                 // Exact match
                 if src_off == offset {
-                    return Some((line_idx, col_idx));
+                    return Some(ScreenPos::new(line_idx, col_idx));
                 }
 
                 // Track closest position at or before target offset
@@ -419,13 +419,13 @@ impl LayoutMap {
             }
         }
 
-        best.map(|(line, col, _)| (line, col))
+        best.map(|(line, col, _)| ScreenPos::new(line, col))
     }
 
     /// Get all screen positions that map to a source range
     /// Useful for highlighting selections
     /// O(log n + k) where k is the number of positions in range
-    pub fn source_range_to_screen(&self, start: ByteOffset, end: ByteOffset) -> Vec<(usize, usize)> {
+    pub fn source_range_to_screen(&self, start: ByteOffset, end: ByteOffset) -> Vec<ScreenPos> {
         if !self.index_built || self.offset_index.is_empty() || start >= end {
             return Vec::new();
         }
@@ -439,7 +439,7 @@ impl LayoutMap {
         // Collect positions in range - O(k) where k = end_idx - start_idx
         self.offset_index[start_idx..end_idx]
             .iter()
-            .map(|(_, line, col)| (*line, *col))
+            .map(|(_, line, col)| ScreenPos::new(*line, *col))
             .collect()
     }
 
@@ -626,8 +626,8 @@ mod tests {
         assert_eq!(map.screen_to_source(0, 6), Some(ByteOffset(4))); // 'o'
 
         // Source to screen
-        assert_eq!(map.source_to_screen(ByteOffset(0)), Some((0, 2))); // offset 0 -> (0, 2)
-        assert_eq!(map.source_to_screen(ByteOffset(4)), Some((0, 6))); // offset 4 -> (0, 6)
+        assert_eq!(map.source_to_screen(ByteOffset(0)), Some(ScreenPos::new(0, 2))); // offset 0 -> (0, 2)
+        assert_eq!(map.source_to_screen(ByteOffset(4)), Some(ScreenPos::new(0, 6))); // offset 4 -> (0, 6)
     }
 
     #[test]
@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(map.screen_to_source_nearest(0, 10), Some(ByteOffset(2))); // After 'i'
 
         // Screen position for end-of-line offset
-        assert_eq!(map.source_to_screen(ByteOffset(2)), Some((0, 4))); // One past 'i' column
+        assert_eq!(map.source_to_screen(ByteOffset(2)), Some(ScreenPos::new(0, 4))); // One past 'i' column
     }
 
     #[test]
