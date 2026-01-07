@@ -1,0 +1,31 @@
+[package]
+name = "mdview"
+version = "0.1.0"
+edition = "2024"
+authors = ["Harry Stamatoukos"]
+description = "A beautiful terminal markdown viewer with editorial aesthetics"
+license = "MIT"
+repository = "https://github.com/harrystamatoukos/mdview"
+readme = "README.md"
+keywords = ["markdown", "viewer", "terminal", "tui", "reader"]
+categories = ["command-line-utilities", "text-processing"]
+
+[dependencies]
+# Markdown parsing
+pulldown-cmark = "0.12"
+
+# TUI framework
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Syntax highlighting for code blocks
+syntect = "5.2"
+
+# File watching for --watch mode
+notify = "7.0"
+
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Error handling
+anyhow = "1.0"

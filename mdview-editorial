@@ -1,0 +1,26 @@
+#!/bin/bash
+# Editorial color scheme wrapper for mdview
+# Warm, humanist colors like a well-edited book
+
+# Set editorial colors (warm ivory background, warm charcoal text)
+printf '\033]11;#FAF7F2\007'  # Background: warm ivory
+printf '\033]10;#37352F\007'  # Foreground: warm charcoal
+printf '\033]4;0;#37352F\007'  # Black: warm charcoal
+printf '\033]4;1;#A65353\007'  # Red: muted terracotta
+printf '\033]4;2;#6B8E6B\007'  # Green: sage
+printf '\033]4;3;#B8963E\007'  # Yellow: warm ochre
+printf '\033]4;4;#5B7B8C\007'  # Blue: dusty steel
+printf '\033]4;5;#8B6B8B\007'  # Magenta: dusty mauve
+printf '\033]4;6;#5B8B8B\007'  # Cyan: muted teal
+printf '\033]4;7;#E8E4DD\007'  # White: warm light gray
+printf '\033]4;8;#635D54\007'  # Bright black
+printf '\033]4;9;#C46A6A\007'  # Bright red
+printf '\033]4;10;#7FA37F\007' # Bright green
+printf '\033]4;11;#CBA94E\007' # Bright yellow
+printf '\033]4;12;#6E92A6\007' # Bright blue
+printf '\033]4;13;#A37FA3\007' # Bright magenta
+printf '\033]4;14;#6EA3A3\007' # Bright cyan
+printf '\033]4;15;#FAF7F2\007' # Bright white: warm ivory
+
+# Run mdview
+exec ~/Personal-Projects/mdviewer/target/release/mdview "$@"
