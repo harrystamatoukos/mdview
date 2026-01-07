@@ -278,38 +278,21 @@ fn render_element_mapped(
         }
 
         Element::CodeBlock { language, code, source } => {
+            // Blank line before code block
             lines.push(Line::from(""));
             layout_map.push_line(Vec::new());
-
-            let lang_label = language.as_deref().unwrap_or("");
-
-            // Language label (subtle, above the rule)
-            if !lang_label.is_empty() {
-                let mut builder = MappedLineBuilder::new();
-                builder.push_synthetic_raw(margin);
-                builder.push_synthetic(&format!("    {}", lang_label), theme.code_border());
-                let (line, chars) = builder.finish();
-                lines.push(line);
-                layout_map.push_line(chars);
-            }
-
-            // Top rule (simple horizontal line, no box corners)
-            let mut builder = MappedLineBuilder::new();
-            builder.push_synthetic_raw(margin);
-            builder.push_synthetic(&format!("    {}", "─".repeat(width.saturating_sub(4))), theme.code_border());
-            let (line, chars) = builder.finish();
-            lines.push(line);
-            layout_map.push_line(chars);
 
             // Calculate where actual code content starts (after opening fence line)
             // Fenced code blocks: "```" + language (if any) + "\n"
             let fence_line_len = 3 + language.as_ref().map(|l| l.len()).unwrap_or(0) + 1;
             let mut current_offset = source.start.get() + fence_line_len;
 
+            // Code content - just indentation, no borders or boxes
+            // Per DESIGN_PRINCIPLES: whitespace and indentation provide structure
             for code_line in code.lines() {
                 let mut builder = MappedLineBuilder::new();
                 builder.push_synthetic_raw(margin);
-                builder.push_synthetic("      ", theme.code_border()); // Just indent, no side border
+                builder.push_synthetic("        ", theme.body()); // 8-space indent for code
                 builder.push_mapped(code_line, current_offset, theme.code_block());
                 let (line, chars) = builder.finish();
                 lines.push(line);
@@ -318,14 +301,7 @@ fn render_element_mapped(
                 current_offset += code_line.len() + 1; // +1 for newline
             }
 
-            // Bottom rule (simple horizontal line)
-            let mut builder = MappedLineBuilder::new();
-            builder.push_synthetic_raw(margin);
-            builder.push_synthetic(&format!("    {}", "─".repeat(width.saturating_sub(4))), theme.code_border());
-            let (line, chars) = builder.finish();
-            lines.push(line);
-            layout_map.push_line(chars);
-
+            // Blank line after code block
             lines.push(Line::from(""));
             layout_map.push_line(Vec::new());
         }
@@ -342,19 +318,20 @@ fn render_element_mapped(
 
                 // Add blockquote border to each line
                 for (i, line) in quote_lines.into_iter().enumerate() {
-                    let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    let is_empty = line.spans.iter().all(|s| s.content.trim().is_empty());
                     let quote_chars = quote_map.line(i).map(|s| s.to_vec()).unwrap_or_default();
 
                     let mut builder = MappedLineBuilder::new();
                     builder.push_synthetic_raw(margin);
 
-                    if content.trim().is_empty() {
+                    if is_empty {
                         builder.push_synthetic("    │", theme.blockquote_border());
                     } else {
                         builder.push_synthetic("    │ ", theme.blockquote_border());
                         // Transfer the mapped chars from the nested rendering
                         builder.chars.extend(quote_chars);
-                        builder.spans.push(TuiSpan::styled(content.trim().to_string(), theme.blockquote()));
+                        // Preserve the original spans with their formatting (bold, italic, etc.)
+                        builder.spans.extend(line.spans);
                     }
                     let (line, chars) = builder.finish();
                     lines.push(line);
@@ -954,40 +931,20 @@ fn render_element_to_lines(
             lines.push(Line::from(""));
         }
 
-        Element::CodeBlock { language, code, .. } => {
+        Element::CodeBlock { language: _, code, .. } => {
+            // Blank line before
             lines.push(Line::from(""));
 
-            let lang_label = language.as_deref().unwrap_or("");
-
-            // Language label (subtle, above the rule)
-            if !lang_label.is_empty() {
-                lines.push(Line::from(vec![
-                    TuiSpan::raw(margin.to_string()),
-                    TuiSpan::styled(format!("    {}", lang_label), theme.code_border()),
-                ]));
-            }
-
-            // Top rule (simple horizontal line)
-            lines.push(Line::from(vec![
-                TuiSpan::raw(margin.to_string()),
-                TuiSpan::styled(format!("    {}", "─".repeat(width.saturating_sub(4))), theme.code_border()),
-            ]));
-
-            // Code content (indented, no side border)
+            // Code content - just indentation, no borders
             for code_line in code.lines() {
                 lines.push(Line::from(vec![
                     TuiSpan::raw(margin.to_string()),
-                    TuiSpan::raw("      "),
+                    TuiSpan::raw("        "), // 8-space indent
                     TuiSpan::styled(code_line.to_string(), theme.code_block()),
                 ]));
             }
 
-            // Bottom rule
-            lines.push(Line::from(vec![
-                TuiSpan::raw(margin.to_string()),
-                TuiSpan::styled(format!("    {}", "─".repeat(width.saturating_sub(4))), theme.code_border()),
-            ]));
-
+            // Blank line after
             lines.push(Line::from(""));
         }
 
@@ -1000,18 +957,20 @@ fn render_element_to_lines(
                 render_element_to_lines(el, &mut quote_lines, "", width.saturating_sub(BLOCKQUOTE_WIDTH_REDUCTION), theme);
 
                 for line in quote_lines {
-                    let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                    if content.trim().is_empty() {
+                    let is_empty = line.spans.iter().all(|s| s.content.trim().is_empty());
+                    if is_empty {
                         lines.push(Line::from(vec![
                             TuiSpan::raw(margin.to_string()),
                             TuiSpan::styled("    │", theme.blockquote_border()),
                         ]));
                     } else {
-                        lines.push(Line::from(vec![
+                        // Preserve original spans with their formatting
+                        let mut spans = vec![
                             TuiSpan::raw(margin.to_string()),
                             TuiSpan::styled("    │ ", theme.blockquote_border()),
-                            TuiSpan::styled(content.trim().to_string(), theme.blockquote()),
-                        ]));
+                        ];
+                        spans.extend(line.spans);
+                        lines.push(Line::from(spans));
                     }
                 }
             }
@@ -1325,22 +1284,13 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
                 .collect();
             format!("{}\n\n", wrapped.join("\n"))
         }
-        Element::CodeBlock { language, code, .. } => {
-            let lang = language.as_deref().unwrap_or("");
-            let rule_width = OPTIMAL_WIDTH.saturating_sub(4);
+        Element::CodeBlock { language: _, code, .. } => {
             let mut output = String::from("\n");
-            // Language label (if present)
-            if !lang.is_empty() {
-                output.push_str(&format!("{}    {}\n", margin, lang));
-            }
-            // Top rule
-            output.push_str(&format!("{}    {}\n", margin, "─".repeat(rule_width)));
-            // Code content (indented)
+            // Code content - just indentation, no borders
             for line in code.lines() {
-                output.push_str(&format!("{}      {}\n", margin, line));
+                output.push_str(&format!("{}        {}\n", margin, line));
             }
-            // Bottom rule
-            output.push_str(&format!("{}    {}\n\n", margin, "─".repeat(rule_width)));
+            output.push('\n');
             output
         }
         Element::BlockQuote { elements, .. } => {
