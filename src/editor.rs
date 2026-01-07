@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use crate::document::Document;
 use crate::primitives::ByteOffset;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -182,12 +183,10 @@ impl History {
 /// Mutable editor state holding the markdown content
 #[derive(Debug, Clone)]
 pub struct EditorState {
-    /// The markdown content being edited
-    content: String,
+    /// The document containing source and parsed AST
+    document: Document,
     /// Cursor position as byte offset in content
     cursor: ByteOffset,
-    /// Whether content has been modified since last save
-    dirty: bool,
     /// Undo/redo history
     history: History,
 }
@@ -196,16 +195,25 @@ impl EditorState {
     /// Create a new editor state from content
     pub fn new(content: String) -> Self {
         Self {
-            content,
+            document: Document::new(content),
             cursor: ByteOffset::ZERO,
-            dirty: false,
             history: History::default(),
         }
     }
 
     /// Get the content
     pub fn content(&self) -> &str {
-        &self.content
+        self.document.source()
+    }
+
+    /// Get access to the document (for parsing/rendering)
+    pub fn document(&mut self) -> &mut Document {
+        &mut self.document
+    }
+
+    /// Get read-only access to the document
+    pub fn document_ref(&self) -> &Document {
+        &self.document
     }
 
     /// Get current cursor position (byte offset)
@@ -215,27 +223,27 @@ impl EditorState {
 
     /// Set cursor position (clamped to valid range)
     pub fn set_cursor(&mut self, pos: ByteOffset) {
-        self.cursor = pos.min(ByteOffset(self.content.len()));
+        self.cursor = pos.min(ByteOffset(self.document.source_len()));
     }
 
     /// Check if content has been modified
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.document.is_dirty()
     }
 
     /// Mark content as saved (clear dirty flag)
     pub fn mark_saved(&mut self) {
-        self.dirty = false;
+        self.document.mark_saved();
     }
 
     /// Get content length in bytes
     pub fn len(&self) -> usize {
-        self.content.len()
+        self.document.source_len()
     }
 
     /// Check if content is empty
     pub fn is_empty(&self) -> bool {
-        self.content.is_empty()
+        self.document.source().is_empty()
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -254,9 +262,8 @@ impl EditorState {
             text: ch.to_string(),
         });
 
-        self.content.insert(cursor.get(), ch);
+        self.document.source_mut().insert(cursor.get(), ch);
         self.cursor = cursor + ch.len_utf8();
-        self.dirty = true;
 
         self.cursor
     }
@@ -274,9 +281,8 @@ impl EditorState {
             });
         }
 
-        self.content.insert_str(cursor.get(), s);
+        self.document.source_mut().insert_str(cursor.get(), s);
         self.cursor = cursor + s.len();
-        self.dirty = true;
 
         self.cursor
     }
@@ -297,21 +303,20 @@ impl EditorState {
         // Find the start of the previous character by going back 1 byte first
         // then finding the char boundary (handles multi-byte UTF-8)
         let mut prev_char_start = self.cursor.get() - 1;
-        while prev_char_start > 0 && !self.content.is_char_boundary(prev_char_start) {
+        while prev_char_start > 0 && !self.document.source().is_char_boundary(prev_char_start) {
             prev_char_start -= 1;
         }
 
         // Record for undo
-        let deleted = self.content[prev_char_start..self.cursor.get()].to_string();
+        let deleted = self.document.source()[prev_char_start..self.cursor.get()].to_string();
         self.history.record(EditOperation::Delete {
             pos: ByteOffset(prev_char_start),
             text: deleted,
         });
 
         // Remove the character
-        self.content.drain(prev_char_start..self.cursor.get());
+        self.document.source_mut().drain(prev_char_start..self.cursor.get());
         self.cursor = ByteOffset(prev_char_start);
-        self.dirty = true;
 
         true
     }
@@ -319,7 +324,7 @@ impl EditorState {
     /// Delete the character at cursor position (delete key)
     /// Returns true if a character was deleted
     pub fn delete_at(&mut self) -> bool {
-        if self.cursor.get() >= self.content.len() {
+        if self.cursor.get() >= self.document.source_len() {
             return false;
         }
 
@@ -327,14 +332,13 @@ impl EditorState {
         let next_char_end = self.next_char_boundary(cursor.get());
 
         // Record for undo
-        let deleted = self.content[cursor.get()..next_char_end].to_string();
+        let deleted = self.document.source()[cursor.get()..next_char_end].to_string();
         self.history.record(EditOperation::Delete {
             pos: cursor,
             text: deleted,
         });
 
-        self.content.drain(cursor.get()..next_char_end);
-        self.dirty = true;
+        self.document.source_mut().drain(cursor.get()..next_char_end);
 
         true
     }
@@ -342,18 +346,17 @@ impl EditorState {
     /// Delete a range of content
     pub fn delete_range(&mut self, start: ByteOffset, end: ByteOffset) {
         let start = self.ensure_char_boundary(start);
-        let end = self.ensure_char_boundary(end.min(ByteOffset(self.content.len())));
+        let end = self.ensure_char_boundary(end.min(ByteOffset(self.document.source_len())));
 
         if start < end {
             // Record for undo
-            let deleted = self.content[start.get()..end.get()].to_string();
+            let deleted = self.document.source()[start.get()..end.get()].to_string();
             self.history.record(EditOperation::Delete {
                 pos: start,
                 text: deleted,
             });
 
-            self.content.drain(start.get()..end.get());
-            self.dirty = true;
+            self.document.source_mut().drain(start.get()..end.get());
 
             // Adjust cursor if it was in the deleted range
             if self.cursor > start {
@@ -368,9 +371,10 @@ impl EditorState {
 
     /// Replace all content (e.g., after reload)
     pub fn replace_content(&mut self, new_content: String) {
-        self.content = new_content;
-        self.cursor = self.cursor.min(ByteOffset(self.content.len()));
-        // Don't mark dirty - this is a reload, not an edit
+        self.document.set_source(new_content);
+        self.cursor = self.cursor.min(ByteOffset(self.document.source_len()));
+        // Clear dirty flag since this is a reload
+        self.document.mark_saved();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -379,7 +383,7 @@ impl EditorState {
 
     /// Move cursor to the next character
     pub fn move_cursor_forward(&mut self) {
-        if self.cursor.get() < self.content.len() {
+        if self.cursor.get() < self.document.source_len() {
             self.cursor = ByteOffset(self.next_char_boundary(self.cursor.get()));
         }
     }
@@ -398,7 +402,7 @@ impl EditorState {
 
     /// Move cursor to end of content
     pub fn move_cursor_to_end(&mut self) {
-        self.cursor = ByteOffset(self.content.len());
+        self.cursor = ByteOffset(self.document.source_len());
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -407,10 +411,11 @@ impl EditorState {
 
     /// Ensure position is at a valid UTF-8 character boundary
     fn ensure_char_boundary(&self, pos: ByteOffset) -> ByteOffset {
-        let pos = pos.get().min(self.content.len());
+        let content = self.document.source();
+        let pos = pos.get().min(content.len());
 
         // If already at boundary, return as-is
-        if self.content.is_char_boundary(pos) {
+        if content.is_char_boundary(pos) {
             return ByteOffset(pos);
         }
 
@@ -420,8 +425,9 @@ impl EditorState {
 
     /// Find the previous character boundary
     fn prev_char_boundary(&self, pos: usize) -> usize {
-        let mut p = pos.min(self.content.len());
-        while p > 0 && !self.content.is_char_boundary(p) {
+        let content = self.document.source();
+        let mut p = pos.min(content.len());
+        while p > 0 && !content.is_char_boundary(p) {
             p -= 1;
         }
         p
@@ -429,14 +435,15 @@ impl EditorState {
 
     /// Find the next character boundary
     fn next_char_boundary(&self, pos: usize) -> usize {
+        let content = self.document.source();
         let mut p = pos;
-        while p < self.content.len() && !self.content.is_char_boundary(p) {
+        while p < content.len() && !content.is_char_boundary(p) {
             p += 1;
         }
         // Move past the current character
-        if p < self.content.len() {
+        if p < content.len() {
             p += 1;
-            while p < self.content.len() && !self.content.is_char_boundary(p) {
+            while p < content.len() && !content.is_char_boundary(p) {
                 p += 1;
             }
         }
@@ -449,9 +456,10 @@ impl EditorState {
 
     /// Find the start of the line containing the given position
     pub fn line_start(&self, pos: ByteOffset) -> ByteOffset {
-        let pos = pos.get().min(self.content.len());
+        let content = self.document.source();
+        let pos = pos.get().min(content.len());
         // Search backward for newline or start of content
-        if let Some(idx) = self.content[..pos].rfind('\n') {
+        if let Some(idx) = content[..pos].rfind('\n') {
             ByteOffset(idx + 1) // Position after the newline
         } else {
             ByteOffset::ZERO // Start of content
@@ -460,12 +468,13 @@ impl EditorState {
 
     /// Find the end of the line containing the given position (before newline)
     pub fn line_end(&self, pos: ByteOffset) -> ByteOffset {
-        let pos = pos.get().min(self.content.len());
+        let content = self.document.source();
+        let pos = pos.get().min(content.len());
         // Search forward for newline or end of content
-        if let Some(idx) = self.content[pos..].find('\n') {
+        if let Some(idx) = content[pos..].find('\n') {
             ByteOffset(pos + idx)
         } else {
-            ByteOffset(self.content.len())
+            ByteOffset(content.len())
         }
     }
 
@@ -473,7 +482,7 @@ impl EditorState {
     pub fn line_content(&self, pos: ByteOffset) -> &str {
         let start = self.line_start(pos);
         let end = self.line_end(pos);
-        &self.content[start.get()..end.get()]
+        &self.document.source()[start.get()..end.get()]
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -483,12 +492,13 @@ impl EditorState {
     /// Find the start of the current or previous word
     /// Words are defined as sequences of alphanumeric/underscore characters
     pub fn word_start(&self, pos: ByteOffset) -> ByteOffset {
-        let pos = pos.get().min(self.content.len());
+        let content = self.document.source();
+        let pos = pos.get().min(content.len());
         if pos == 0 {
             return ByteOffset::ZERO;
         }
 
-        let bytes = self.content.as_bytes();
+        let bytes = content.as_bytes();
         let mut p = pos;
 
         // Skip any whitespace before cursor
@@ -506,12 +516,13 @@ impl EditorState {
 
     /// Find the end of the current or next word
     pub fn word_end(&self, pos: ByteOffset) -> ByteOffset {
-        let pos = pos.get().min(self.content.len());
-        if pos >= self.content.len() {
-            return ByteOffset(self.content.len());
+        let content = self.document.source();
+        let pos = pos.get().min(content.len());
+        if pos >= content.len() {
+            return ByteOffset(content.len());
         }
 
-        let bytes = self.content.as_bytes();
+        let bytes = content.as_bytes();
         let mut p = pos;
 
         // Skip any whitespace after cursor
@@ -542,15 +553,14 @@ impl EditorState {
         let word_start = self.word_start(self.cursor);
         if word_start < self.cursor {
             // Record for undo
-            let deleted = self.content[word_start.get()..self.cursor.get()].to_string();
+            let deleted = self.document.source()[word_start.get()..self.cursor.get()].to_string();
             self.history.record(EditOperation::Delete {
                 pos: word_start,
                 text: deleted,
             });
 
-            self.content.drain(word_start.get()..self.cursor.get());
+            self.document.source_mut().drain(word_start.get()..self.cursor.get());
             self.cursor = word_start;
-            self.dirty = true;
             return true;
         }
         false
@@ -559,21 +569,20 @@ impl EditorState {
     /// Delete from cursor to end of current/next word (Ctrl+Delete)
     /// Returns true if something was deleted
     pub fn delete_word_after(&mut self) -> bool {
-        if self.cursor.get() >= self.content.len() {
+        if self.cursor.get() >= self.document.source_len() {
             return false;
         }
 
         let word_end = self.word_end(self.cursor);
         if word_end > self.cursor {
             // Record for undo
-            let deleted = self.content[self.cursor.get()..word_end.get()].to_string();
+            let deleted = self.document.source()[self.cursor.get()..word_end.get()].to_string();
             self.history.record(EditOperation::Delete {
                 pos: self.cursor,
                 text: deleted,
             });
 
-            self.content.drain(self.cursor.get()..word_end.get());
-            self.dirty = true;
+            self.document.source_mut().drain(self.cursor.get()..word_end.get());
             return true;
         }
         false
@@ -582,12 +591,13 @@ impl EditorState {
     /// Get the word boundaries at the given position (for double-click selection)
     /// Returns (start, end) of the word
     pub fn word_at(&self, pos: ByteOffset) -> (ByteOffset, ByteOffset) {
-        let pos = pos.get().min(self.content.len());
-        if pos >= self.content.len() {
+        let content = self.document.source();
+        let pos = pos.get().min(content.len());
+        if pos >= content.len() {
             return (ByteOffset(pos), ByteOffset(pos));
         }
 
-        let bytes = self.content.as_bytes();
+        let bytes = content.as_bytes();
 
         // Find word start
         let mut start = pos;
@@ -606,7 +616,7 @@ impl EditorState {
 
     /// Insert string at a specific position (not at cursor)
     pub fn insert_at(&mut self, pos: ByteOffset, s: &str) {
-        let pos = self.ensure_char_boundary(pos).min(ByteOffset(self.content.len()));
+        let pos = self.ensure_char_boundary(pos).min(ByteOffset(self.document.source_len()));
 
         // Record for undo
         if !s.is_empty() {
@@ -616,8 +626,7 @@ impl EditorState {
             });
         }
 
-        self.content.insert_str(pos.get(), s);
-        self.dirty = true;
+        self.document.source_mut().insert_str(pos.get(), s);
 
         // Adjust cursor if it was after insertion point
         if self.cursor >= pos {
@@ -634,7 +643,7 @@ impl EditorState {
     pub fn undo(&mut self) -> Option<ByteOffset> {
         if let Some(op) = self.history.pop_undo() {
             let cursor_pos = self.apply_operation_without_history(&op);
-            self.dirty = true;
+            self.document.mark_modified();
             Some(cursor_pos)
         } else {
             None
@@ -646,7 +655,7 @@ impl EditorState {
     pub fn redo(&mut self) -> Option<ByteOffset> {
         if let Some(op) = self.history.pop_redo() {
             let cursor_pos = self.apply_operation_without_history(&op);
-            self.dirty = true;
+            self.document.mark_modified();
             Some(cursor_pos)
         } else {
             None
@@ -657,14 +666,14 @@ impl EditorState {
     fn apply_operation_without_history(&mut self, op: &EditOperation) -> ByteOffset {
         match op {
             EditOperation::Insert { pos, text } => {
-                let pos = self.ensure_char_boundary(*pos).min(ByteOffset(self.content.len()));
-                self.content.insert_str(pos.get(), text);
+                let pos = self.ensure_char_boundary(*pos).min(ByteOffset(self.document.source_len()));
+                self.document.source_mut().insert_str(pos.get(), text);
                 pos + text.len() // Cursor at end of inserted text
             }
             EditOperation::Delete { pos, text } => {
                 let pos = self.ensure_char_boundary(*pos);
-                let end = (pos.get() + text.len()).min(self.content.len());
-                self.content.drain(pos.get()..end);
+                let end = (pos.get() + text.len()).min(self.document.source_len());
+                self.document.source_mut().drain(pos.get()..end);
                 pos // Cursor at deletion point
             }
         }
@@ -683,12 +692,12 @@ impl EditorState {
     /// Count words in the content
     /// Uses simple whitespace splitting (matches most word processors)
     pub fn word_count(&self) -> usize {
-        self.content.split_whitespace().count()
+        self.document.word_count()
     }
 
     /// Count characters in the content (including whitespace)
     pub fn char_count(&self) -> usize {
-        self.content.chars().count()
+        self.document.char_count()
     }
 }
 
