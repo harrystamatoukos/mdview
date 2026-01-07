@@ -14,6 +14,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io::{self, stdout};
+use std::path::PathBuf;
 
 use crate::editor::EditorState;
 use crate::input::{ClickType, InputState};
@@ -45,14 +46,15 @@ pub struct Pager<'a> {
     view: ViewState,          // Scroll position and animation
     input: InputState,        // Mouse/click state
     cursor_visible: bool,     // For cursor blink animation
-    cursor_visual_override: Option<ScreenPos>,  // Position override (e.g., after Enter key)
     terminal_width: u16,
     content_area: (u16, u16, u16, u16),  // Content area for mouse handling
 
     // Mode state
     edit_mode: bool,          // View mode vs edit mode
-    pending_paragraph: Option<(ByteOffset, usize, usize)>,  // Click in empty space state
     theme: Theme,
+
+    // File path for save functionality
+    file_path: Option<PathBuf>,
 }
 
 // Minimum poll time during active editing (ms) - 60fps for smoothness
@@ -61,7 +63,7 @@ const ACTIVE_POLL_MS: u64 = 16;
 const IDLE_POLL_MS: u64 = 50;
 
 impl<'a> Pager<'a> {
-    pub fn new(mut editor: EditorState, terminal_width: u16, theme: Theme) -> Self {
+    pub fn new(mut editor: EditorState, terminal_width: u16, theme: Theme, file_path: Option<PathBuf>) -> Self {
         // Initial render - use document directly to avoid redundant parsing
         let (content, layout_map) = renderer::render_to_text(
             editor.document(),
@@ -87,12 +89,11 @@ impl<'a> Pager<'a> {
             view: ViewState::new(),
             input: InputState::new(),
             cursor_visible: true,
-            cursor_visual_override: None,
             terminal_width,
             content_area: (0, 0, 0, 0),
             edit_mode: true,
-            pending_paragraph: None,
             theme,
+            file_path,
         }
     }
 
@@ -119,6 +120,54 @@ impl<'a> Pager<'a> {
         self.layout_map.build_index();
     }
 
+    /// Save content to file, trimming trailing whitespace from each line
+    /// Placeholder spaces inserted during editing are cleaned up here
+    fn save(&mut self) -> Result<()> {
+        let Some(ref path) = self.file_path else {
+            return Ok(()); // No file to save to
+        };
+
+        // Clean up content: trim trailing whitespace from each line
+        // This removes placeholder spaces used for cursor positioning
+        let content = self.editor.content();
+        let cleaned: String = content
+            .lines()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Ensure file ends with a newline
+        let final_content = if cleaned.ends_with('\n') {
+            cleaned
+        } else {
+            cleaned + "\n"
+        };
+
+        // Write to file
+        std::fs::write(path, &final_content)?;
+
+        // Update editor content to match cleaned version
+        // We need to handle cursor position carefully
+        let cursor = self.editor.cursor();
+        let cursor_offset = cursor.get();
+
+        // Replace content and mark saved
+        self.editor.replace_content(final_content.clone());
+        self.editor.mark_saved();
+
+        // Adjust cursor if it was past the new end
+        if cursor_offset >= final_content.len() {
+            self.editor.set_cursor(ByteOffset::new(final_content.len().saturating_sub(1)));
+        } else {
+            self.editor.set_cursor(cursor);
+        }
+
+        // Re-render with cleaned content
+        self.re_render();
+
+        Ok(())
+    }
+
     /// Mark that input was received (for responsive polling)
     fn mark_input(&mut self) {
         self.input.mark_input();
@@ -132,18 +181,6 @@ impl<'a> Pager<'a> {
     /// Handle a character input for editing with smart punctuation
     /// Designed for maximum fluidity - no delays or pending states
     fn handle_char_input(&mut self, ch: char) {
-        // Clear visual override - we now have real content to map to
-        self.cursor_visual_override = None;
-
-        // Handle pending paragraph - user clicked in empty space and is now typing
-        if let Some((insert_offset, _visual_line, _visual_col)) = self.pending_paragraph.take() {
-            // Insert newlines to create the paragraph at the clicked location
-            self.editor.set_cursor(insert_offset);
-            self.editor.insert_str("\n\n");
-            // Cursor is now positioned after the newlines, ready for new content
-            self.selection.move_to(self.editor.cursor());
-        }
-
         // Delete selection first if any
         if self.selection.is_active() {
             self.delete_selection();
@@ -399,8 +436,8 @@ impl<'a> Pager<'a> {
     /// - Normal text: insert single newline (markdown wraps soft breaks)
     fn handle_smart_enter(&mut self) {
         // Clear any pending paragraph or visual override
-        self.pending_paragraph = None;
-        self.cursor_visual_override = None;
+        // Click/navigation creates real positions - no pending state needed
+        // Placeholder space provides cursor anchor - no visual override needed
 
         // Delete selection first if any
         if self.selection.is_active() {
@@ -425,12 +462,12 @@ impl<'a> Pager<'a> {
             let has_content = !list_info.content.trim().is_empty();
 
             if !has_content && cursor_in_line <= content_start {
-                // Exit list: remove the marker and insert newline
+                // Exit list: remove the marker and insert newline + placeholder space
                 self.editor.delete_range(line_start, line_start + list_info.marker_len);
                 self.editor.set_cursor(line_start);
-                self.editor.insert_char('\n');
-                self.editor.set_cursor(line_start + 1);
-                self.selection.move_to(line_start + 1);
+                self.editor.insert_str("\n ");  // newline + placeholder space
+                self.editor.set_cursor(line_start + 2);
+                self.selection.move_to(line_start + 2);
             } else {
                 // Continue list: insert newline + marker
                 self.editor.set_cursor(cursor_pos);
@@ -458,7 +495,7 @@ impl<'a> Pager<'a> {
             };
 
             if quote_content.trim().is_empty() {
-                // Exit blockquote: remove the marker and insert newline
+                // Exit blockquote: remove the marker and insert newline + placeholder space
                 let marker_end = if line.trim_start().starts_with("> ") {
                     line.len() - line.trim_start().len() + 2
                 } else {
@@ -466,9 +503,9 @@ impl<'a> Pager<'a> {
                 };
                 self.editor.delete_range(line_start, line_start + marker_end);
                 self.editor.set_cursor(line_start);
-                self.editor.insert_char('\n');
-                self.editor.set_cursor(line_start + 1);
-                self.selection.move_to(line_start + 1);
+                self.editor.insert_str("\n ");  // newline + placeholder space
+                self.editor.set_cursor(line_start + 2);
+                self.selection.move_to(line_start + 2);
             } else {
                 // Continue blockquote
                 self.editor.set_cursor(cursor_pos);
@@ -485,11 +522,12 @@ impl<'a> Pager<'a> {
         }
 
         // Normal text: insert a hard break for immediate visual line break
-        // Markdown hard break = two trailing spaces + newline ("  \n")
-        // This gives word processor behavior (Enter = new line) while staying valid markdown
+        // Markdown hard break = two trailing spaces + newline + placeholder space
+        // The trailing space acts as cursor anchor - gives LayoutMap something to map to
+        // It will be replaced when user types, or trimmed on save
         self.editor.set_cursor(cursor_pos);
-        self.editor.insert_str("  \n");
-        let new_cursor = cursor_pos + 3; // "  \n" is 3 bytes
+        self.editor.insert_str("  \n ");  // hard break + placeholder space
+        let new_cursor = cursor_pos + 4;  // "  \n " is 4 bytes, cursor on the space
         self.editor.set_cursor(new_cursor);
         self.selection.move_to(new_cursor);
 
@@ -570,8 +608,8 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to previous word boundary (Ctrl+Left)
     fn cursor_word_left(&mut self) {
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
         {
             let current = self.editor.cursor();
             let new_pos = self.editor.word_start(current);
@@ -583,8 +621,8 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to next word boundary (Ctrl+Right)
     fn cursor_word_right(&mut self) {
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
         {
             let current = self.editor.cursor();
             let new_pos = self.editor.word_end(current);
@@ -596,8 +634,8 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to start of line (Home key)
     fn cursor_line_start(&mut self) {
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
         {
             let current = self.editor.cursor();
             let new_pos = self.editor.line_start(current);
@@ -609,8 +647,8 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to end of line (End key)
     fn cursor_line_end(&mut self) {
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
         {
             let current = self.editor.cursor();
             let new_pos = self.editor.line_end(current);
@@ -691,8 +729,8 @@ impl<'a> Pager<'a> {
     /// Supports clicking in empty space to create pending paragraphs
     fn handle_mouse_click(&mut self, screen_x: u16, screen_y: u16) {
         // Clear overrides - user is clicking to position
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
         let (area_x, area_y, area_width, area_height) = self.content_area;
 
         // Check if click is within content area
@@ -735,13 +773,16 @@ impl<'a> Pager<'a> {
                 }
             }
         } else {
-            // Click in empty space - create pending paragraph
-            // Find the nearest content above to determine insertion point
+            // Click in empty space - immediately create position with placeholder
+            // This is consistent with Enter key behavior (space as cursor anchor)
             if let Some(insert_offset) = self.layout_map.find_insertion_point_before_line(content_line) {
-                // Use content margin for column position in empty space
-                let visual_col = self.layout_map.content_margin();
-                self.pending_paragraph = Some((insert_offset, content_line, visual_col));
-                self.selection = Selection::new(insert_offset);
+                // Insert paragraph break + placeholder space at insertion point
+                self.editor.set_cursor(insert_offset);
+                self.editor.insert_str("\n\n ");  // paragraph break + placeholder space
+                let new_cursor = insert_offset + 3;  // position on the placeholder space
+                self.editor.set_cursor(new_cursor);
+                self.selection = Selection::new(new_cursor);
+                self.re_render();
             }
         }
     }
@@ -776,8 +817,8 @@ impl<'a> Pager<'a> {
     /// Simple and fast for fluid editing
     fn handle_backspace(&mut self) {
         // Clear visual override - user is actively editing
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
 
         // If there's a selection, delete it instead
         if self.selection.is_active() {
@@ -803,8 +844,8 @@ impl<'a> Pager<'a> {
     /// Simple and fast for fluid editing
     fn handle_delete(&mut self) {
         // Clear visual override - user is actively editing
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
 
         // If there's a selection, delete it instead
         if self.selection.is_active() {
@@ -1025,8 +1066,8 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to next valid position (right arrow)
     fn cursor_right(&mut self) {
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
         {
             let current = self.editor.cursor();
             if let Some(next) = self.layout_map.next_cursor_position(current) {
@@ -1039,8 +1080,8 @@ impl<'a> Pager<'a> {
 
     /// Move cursor to previous valid position (left arrow)
     fn cursor_left(&mut self) {
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
         {
             let current = self.editor.cursor();
             if let Some(prev) = self.layout_map.prev_cursor_position(current) {
@@ -1052,8 +1093,8 @@ impl<'a> Pager<'a> {
 
     /// Move cursor up one line - fluid movement like Google Docs
     fn cursor_up(&mut self, viewport_height: usize) {
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
         {
             let current = self.editor.cursor();
             if let Some(pos) = self.layout_map.source_to_screen(current) {
@@ -1071,8 +1112,8 @@ impl<'a> Pager<'a> {
 
     /// Move cursor down one line - fluid movement like Google Docs
     fn cursor_down(&mut self, viewport_height: usize) {
-        self.cursor_visual_override = None;
-        self.pending_paragraph = None;
+        // Placeholder space provides cursor anchor - no visual override needed
+        // Click/navigation creates real positions - no pending state needed
         {
             let current = self.editor.cursor();
             if let Some(pos) = self.layout_map.source_to_screen(current) {
@@ -1105,16 +1146,8 @@ impl<'a> Pager<'a> {
     }
 
     /// Get cursor screen position relative to content
-    /// Uses visual override if set (e.g., after Enter, before first keystroke)
+    /// Cursor position always maps via LayoutMap (placeholder spaces ensure valid mapping)
     fn cursor_screen_position(&self) -> Option<ScreenPos> {
-        // Visual override takes precedence (used after Enter to show where content WILL appear)
-        if let Some(override_pos) = self.cursor_visual_override {
-            return Some(override_pos);
-        }
-        // Pending paragraph position (user clicked in empty space)
-        if let Some((_, line, col)) = self.pending_paragraph {
-            return Some(ScreenPos::new(line, col));
-        }
         self.layout_map.source_to_screen(self.editor.cursor())
     }
 
@@ -1159,7 +1192,7 @@ impl<'a> Pager<'a> {
 }
 
 /// Run the interactive pager
-pub fn run(content: &str, theme: Theme) -> Result<()> {
+pub fn run(content: &str, theme: Theme, file_path: Option<PathBuf>) -> Result<()> {
     // Setup terminal with mouse support and typewriter-style block cursor
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -1175,7 +1208,7 @@ pub fn run(content: &str, theme: Theme) -> Result<()> {
     // Get terminal size and create editor state
     let size = terminal.size()?;
     let editor = EditorState::new(content.to_string());
-    let mut pager = Pager::new(editor, size.width, theme);
+    let mut pager = Pager::new(editor, size.width, theme, file_path);
 
     let result = run_event_loop(&mut terminal, &mut pager);
 
@@ -1238,6 +1271,11 @@ fn run_event_loop(
                             KeyCode::Char('x') if ctrl => pager.cut_selection(),
                             KeyCode::Char('v') if ctrl => pager.paste(),
                             KeyCode::Char('a') if ctrl => pager.select_all(),
+
+                            // Save
+                            KeyCode::Char('s') if ctrl => {
+                                let _ = pager.save();
+                            }
 
                             // Arrow keys with Shift = extend selection
                             KeyCode::Up if shift => {

@@ -53,8 +53,8 @@ fn main() -> Result<()> {
         // Watch mode with pager
         watcher::watch_and_display(&args.file, theme)?;
     } else {
-        // Interactive pager mode
-        pager::run(&content, theme)?;
+        // Interactive pager mode (with file path for saving)
+        pager::run(&content, theme, Some(args.file))?;
     }
 
     Ok(())
