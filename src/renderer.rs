@@ -283,11 +283,20 @@ fn render_element_mapped(
 
             let lang_label = language.as_deref().unwrap_or("");
 
-            // Top border (synthetic)
+            // Language label (subtle, above the rule)
+            if !lang_label.is_empty() {
+                let mut builder = MappedLineBuilder::new();
+                builder.push_synthetic_raw(margin);
+                builder.push_synthetic(&format!("    {}", lang_label), theme.code_border());
+                let (line, chars) = builder.finish();
+                lines.push(line);
+                layout_map.push_line(chars);
+            }
+
+            // Top rule (simple horizontal line, no box corners)
             let mut builder = MappedLineBuilder::new();
             builder.push_synthetic_raw(margin);
-            builder.push_synthetic(&format!("    ╭─ {} ", lang_label), theme.code_border());
-            builder.push_synthetic(&"─".repeat(width.saturating_sub(10 + lang_label.len())), theme.code_border());
+            builder.push_synthetic(&format!("    {}", "─".repeat(width.saturating_sub(4))), theme.code_border());
             let (line, chars) = builder.finish();
             lines.push(line);
             layout_map.push_line(chars);
@@ -300,7 +309,7 @@ fn render_element_mapped(
             for code_line in code.lines() {
                 let mut builder = MappedLineBuilder::new();
                 builder.push_synthetic_raw(margin);
-                builder.push_synthetic("    │ ", theme.code_border());
+                builder.push_synthetic("      ", theme.code_border()); // Just indent, no side border
                 builder.push_mapped(code_line, current_offset, theme.code_block());
                 let (line, chars) = builder.finish();
                 lines.push(line);
@@ -309,10 +318,10 @@ fn render_element_mapped(
                 current_offset += code_line.len() + 1; // +1 for newline
             }
 
-            // Bottom border (synthetic)
+            // Bottom rule (simple horizontal line)
             let mut builder = MappedLineBuilder::new();
             builder.push_synthetic_raw(margin);
-            builder.push_synthetic(&format!("    ╰{}─", "─".repeat(width.saturating_sub(8))), theme.code_border());
+            builder.push_synthetic(&format!("    {}", "─".repeat(width.saturating_sub(4))), theme.code_border());
             let (line, chars) = builder.finish();
             lines.push(line);
             layout_map.push_line(chars);
@@ -950,26 +959,33 @@ fn render_element_to_lines(
 
             let lang_label = language.as_deref().unwrap_or("");
 
-            // Top border with language
+            // Language label (subtle, above the rule)
+            if !lang_label.is_empty() {
+                lines.push(Line::from(vec![
+                    TuiSpan::raw(margin.to_string()),
+                    TuiSpan::styled(format!("    {}", lang_label), theme.code_border()),
+                ]));
+            }
+
+            // Top rule (simple horizontal line)
             lines.push(Line::from(vec![
                 TuiSpan::raw(margin.to_string()),
-                TuiSpan::styled(format!("    ╭─ {} ", lang_label), theme.code_border()),
-                TuiSpan::styled("─".repeat(width.saturating_sub(10 + lang_label.len())), theme.code_border()),
+                TuiSpan::styled(format!("    {}", "─".repeat(width.saturating_sub(4))), theme.code_border()),
             ]));
 
-            // Code content with left border
+            // Code content (indented, no side border)
             for code_line in code.lines() {
                 lines.push(Line::from(vec![
                     TuiSpan::raw(margin.to_string()),
-                    TuiSpan::styled("    │ ", theme.code_border()),
+                    TuiSpan::raw("      "),
                     TuiSpan::styled(code_line.to_string(), theme.code_block()),
                 ]));
             }
 
-            // Bottom border
+            // Bottom rule
             lines.push(Line::from(vec![
                 TuiSpan::raw(margin.to_string()),
-                TuiSpan::styled(format!("    ╰{}─", "─".repeat(width.saturating_sub(8))), theme.code_border()),
+                TuiSpan::styled(format!("    {}", "─".repeat(width.saturating_sub(4))), theme.code_border()),
             ]));
 
             lines.push(Line::from(""));
@@ -1311,12 +1327,20 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
         }
         Element::CodeBlock { language, code, .. } => {
             let lang = language.as_deref().unwrap_or("");
-            let border_width = OPTIMAL_WIDTH.saturating_sub(lang.len() + 5);
-            let mut output = format!("\n{}╭─ {} {}\n", margin, lang, "─".repeat(border_width));
-            for line in code.lines() {
-                output.push_str(&format!("{}│ {}\n", margin, line));
+            let rule_width = OPTIMAL_WIDTH.saturating_sub(4);
+            let mut output = String::from("\n");
+            // Language label (if present)
+            if !lang.is_empty() {
+                output.push_str(&format!("{}    {}\n", margin, lang));
             }
-            output.push_str(&format!("{}╰{}\n\n", margin, "─".repeat(OPTIMAL_WIDTH.saturating_sub(3))));
+            // Top rule
+            output.push_str(&format!("{}    {}\n", margin, "─".repeat(rule_width)));
+            // Code content (indented)
+            for line in code.lines() {
+                output.push_str(&format!("{}      {}\n", margin, line));
+            }
+            // Bottom rule
+            output.push_str(&format!("{}    {}\n\n", margin, "─".repeat(rule_width)));
             output
         }
         Element::BlockQuote { elements, .. } => {

@@ -8,8 +8,8 @@
 //! either maps to a source byte offset, or is "synthetic" (margins,
 //! borders, list bullets) with no source position.
 
-// Re-export SourceSpan from primitives (single source of truth)
-pub use crate::primitives::SourceSpan;
+// Re-export types from primitives (single source of truth)
+pub use crate::primitives::{ByteOffset, SourceSpan};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // FORMATTING SPAN - Tracks inline formatting markers in source
@@ -142,12 +142,20 @@ pub struct MappedChar {
     pub ch: char,
     /// Source byte offset, or None for synthetic characters
     /// (margins, borders, list bullets, etc.)
-    pub source_offset: Option<usize>,
+    pub source_offset: Option<ByteOffset>,
 }
 
 impl MappedChar {
     /// Create a mapped character with a source position
     pub fn with_source(ch: char, offset: usize) -> Self {
+        Self {
+            ch,
+            source_offset: Some(ByteOffset(offset)),
+        }
+    }
+
+    /// Create a mapped character with a ByteOffset source position
+    pub fn with_byte_offset(ch: char, offset: ByteOffset) -> Self {
         Self {
             ch,
             source_offset: Some(offset),
@@ -181,7 +189,7 @@ pub struct LayoutMap {
     /// For each rendered line: Vec of MappedChars
     lines: Vec<Vec<MappedChar>>,
     /// Sorted index for fast lookups: (source_offset, line, col)
-    offset_index: Vec<(usize, usize, usize)>,
+    offset_index: Vec<(ByteOffset, usize, usize)>,
     /// Formatting spans (bold, italic, code, etc.) for boundary detection
     formatting_spans: Vec<FormattingSpan>,
     /// Whether the index has been built
@@ -242,7 +250,7 @@ impl LayoutMap {
         self.offset_index = Vec::with_capacity(estimated_size);
 
         for (line_idx, line) in self.lines.iter().enumerate() {
-            let mut last_on_line: Option<(usize, usize, char)> = None;
+            let mut last_on_line: Option<(ByteOffset, usize, char)> = None;
 
             for (col_idx, mc) in line.iter().enumerate() {
                 if let Some(offset) = mc.source_offset {
@@ -269,7 +277,7 @@ impl LayoutMap {
 
     /// Get source offset for a screen position
     /// Returns None if position is out of bounds or on a synthetic character
-    pub fn screen_to_source(&self, line: usize, col: usize) -> Option<usize> {
+    pub fn screen_to_source(&self, line: usize, col: usize) -> Option<ByteOffset> {
         self.lines
             .get(line)
             .and_then(|l| l.get(col))
@@ -279,7 +287,7 @@ impl LayoutMap {
     /// Get source offset for screen position, finding nearest if exact not available
     /// Handles empty lines by finding the nearest content line
     #[inline]
-    pub fn screen_to_source_nearest(&self, line: usize, col: usize) -> Option<usize> {
+    pub fn screen_to_source_nearest(&self, line: usize, col: usize) -> Option<ByteOffset> {
         // Try to find offset on the current line first
         if let Some(offset) = self.find_offset_on_line(line, col) {
             return Some(offset);
@@ -290,7 +298,7 @@ impl LayoutMap {
     }
 
     /// Find source offset on a specific line, searching outward from column
-    fn find_offset_on_line(&self, line: usize, col: usize) -> Option<usize> {
+    fn find_offset_on_line(&self, line: usize, col: usize) -> Option<ByteOffset> {
         let line_chars = self.lines.get(line)?;
 
         // Exact position
@@ -314,7 +322,7 @@ impl LayoutMap {
     }
 
     /// Find nearest offset by searching lines above then below
-    fn find_nearest_offset_from_line(&self, from_line: usize) -> Option<usize> {
+    fn find_nearest_offset_from_line(&self, from_line: usize) -> Option<ByteOffset> {
         // Search lines above (return end of last content)
         for search_line in (0..from_line).rev() {
             if let Some(offset) = self.lines.get(search_line).and_then(|chars|
@@ -343,7 +351,7 @@ impl LayoutMap {
     /// Get screen position for a source offset
     /// Uses binary search for O(log n) lookup. Respects content margin for empty lines.
     #[inline]
-    pub fn source_to_screen(&self, offset: usize) -> Option<(usize, usize)> {
+    pub fn source_to_screen(&self, offset: ByteOffset) -> Option<(usize, usize)> {
         if !self.index_built || self.offset_index.is_empty() {
             return self.source_to_screen_linear(offset);
         }
@@ -365,7 +373,7 @@ impl LayoutMap {
                 };
 
                 // Check distance from previous position
-                let distance = offset.saturating_sub(prev_offset);
+                let distance = offset - prev_offset; // ByteOffset - ByteOffset = usize
 
                 // If cursor is close to previous position (1-3 chars, like after typing space/punctuation),
                 // advance cursor on the same line
@@ -388,7 +396,7 @@ impl LayoutMap {
     }
 
     /// Linear search fallback for source-to-screen (used before index built)
-    fn source_to_screen_linear(&self, offset: usize) -> Option<(usize, usize)> {
+    fn source_to_screen_linear(&self, offset: ByteOffset) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize, usize)> = None; // (line, col, offset_diff)
 
         for (line_idx, line) in self.lines.iter().enumerate() {
@@ -402,7 +410,7 @@ impl LayoutMap {
 
                 // Track closest position at or before target offset
                 if src_off <= offset {
-                    let diff = offset - src_off;
+                    let diff = offset - src_off; // ByteOffset - ByteOffset = usize
                     let dominated = best.map_or(false, |(_, _, best_diff)| diff >= best_diff);
                     if !dominated {
                         best = Some((line_idx, col_idx, diff));
@@ -417,7 +425,7 @@ impl LayoutMap {
     /// Get all screen positions that map to a source range
     /// Useful for highlighting selections
     /// O(log n + k) where k is the number of positions in range
-    pub fn source_range_to_screen(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+    pub fn source_range_to_screen(&self, start: ByteOffset, end: ByteOffset) -> Vec<(usize, usize)> {
         if !self.index_built || self.offset_index.is_empty() || start >= end {
             return Vec::new();
         }
@@ -442,7 +450,7 @@ impl LayoutMap {
     /// Find the next valid cursor position after the given source offset
     /// O(log n) using binary search on sorted index
     #[inline]
-    pub fn next_cursor_position(&self, current_offset: usize) -> Option<usize> {
+    pub fn next_cursor_position(&self, current_offset: ByteOffset) -> Option<ByteOffset> {
         if !self.index_built {
             return None;
         }
@@ -455,7 +463,7 @@ impl LayoutMap {
     /// Find the previous valid cursor position before the given source offset
     /// O(log n) using binary search on sorted index
     #[inline]
-    pub fn prev_cursor_position(&self, current_offset: usize) -> Option<usize> {
+    pub fn prev_cursor_position(&self, current_offset: ByteOffset) -> Option<ByteOffset> {
         if !self.index_built {
             return None;
         }
@@ -466,12 +474,12 @@ impl LayoutMap {
     }
 
     /// Get the first valid source offset
-    pub fn first_offset(&self) -> Option<usize> {
+    pub fn first_offset(&self) -> Option<ByteOffset> {
         self.offset_index.first().map(|(o, _, _)| *o)
     }
 
     /// Get the last valid source offset
-    pub fn last_offset(&self) -> Option<usize> {
+    pub fn last_offset(&self) -> Option<ByteOffset> {
         self.offset_index.last().map(|(o, _, _)| *o)
     }
 
@@ -484,7 +492,7 @@ impl LayoutMap {
 
     /// Find the source offset where we should insert content to create a paragraph
     /// before the given visual line. Returns the end of the last content block above.
-    pub fn find_insertion_point_before_line(&self, target_line: usize) -> Option<usize> {
+    pub fn find_insertion_point_before_line(&self, target_line: usize) -> Option<ByteOffset> {
         // Search backwards from target_line to find the last line with content
         for line in (0..target_line).rev() {
             if let Some(chars) = self.lines.get(line) {
@@ -496,7 +504,7 @@ impl LayoutMap {
             }
         }
         // No content found above - insert at start
-        Some(0)
+        Some(ByteOffset::ZERO)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -588,7 +596,7 @@ mod tests {
     fn test_mapped_char() {
         let mc = MappedChar::with_source('a', 42);
         assert_eq!(mc.ch, 'a');
-        assert_eq!(mc.source_offset, Some(42));
+        assert_eq!(mc.source_offset, Some(ByteOffset(42)));
         assert!(!mc.is_synthetic());
 
         let synthetic = MappedChar::synthetic(' ');
@@ -614,12 +622,12 @@ mod tests {
 
         // Screen to source
         assert_eq!(map.screen_to_source(0, 0), None); // Synthetic
-        assert_eq!(map.screen_to_source(0, 2), Some(0)); // 'H'
-        assert_eq!(map.screen_to_source(0, 6), Some(4)); // 'o'
+        assert_eq!(map.screen_to_source(0, 2), Some(ByteOffset(0))); // 'H'
+        assert_eq!(map.screen_to_source(0, 6), Some(ByteOffset(4))); // 'o'
 
         // Source to screen
-        assert_eq!(map.source_to_screen(0), Some((0, 2))); // offset 0 -> (0, 2)
-        assert_eq!(map.source_to_screen(4), Some((0, 6))); // offset 4 -> (0, 6)
+        assert_eq!(map.source_to_screen(ByteOffset(0)), Some((0, 2))); // offset 0 -> (0, 2)
+        assert_eq!(map.source_to_screen(ByteOffset(4)), Some((0, 6))); // offset 4 -> (0, 6)
     }
 
     #[test]
@@ -635,20 +643,20 @@ mod tests {
         map.build_index();
 
         // first_offset is first char, last_offset is end position (after last char)
-        assert_eq!(map.first_offset(), Some(0));
-        assert_eq!(map.last_offset(), Some(3)); // End position is now in index
+        assert_eq!(map.first_offset(), Some(ByteOffset(0)));
+        assert_eq!(map.last_offset(), Some(ByteOffset(3))); // End position is now in index
 
         // Forward navigation
-        assert_eq!(map.next_cursor_position(0), Some(1));
-        assert_eq!(map.next_cursor_position(1), Some(2));
-        assert_eq!(map.next_cursor_position(2), Some(3)); // To end position
-        assert_eq!(map.next_cursor_position(3), None);    // No more forward
+        assert_eq!(map.next_cursor_position(ByteOffset(0)), Some(ByteOffset(1)));
+        assert_eq!(map.next_cursor_position(ByteOffset(1)), Some(ByteOffset(2)));
+        assert_eq!(map.next_cursor_position(ByteOffset(2)), Some(ByteOffset(3))); // To end position
+        assert_eq!(map.next_cursor_position(ByteOffset(3)), None);    // No more forward
 
         // Backward navigation
-        assert_eq!(map.prev_cursor_position(3), Some(2));
-        assert_eq!(map.prev_cursor_position(2), Some(1));
-        assert_eq!(map.prev_cursor_position(1), Some(0));
-        assert_eq!(map.prev_cursor_position(0), None);
+        assert_eq!(map.prev_cursor_position(ByteOffset(3)), Some(ByteOffset(2)));
+        assert_eq!(map.prev_cursor_position(ByteOffset(2)), Some(ByteOffset(1)));
+        assert_eq!(map.prev_cursor_position(ByteOffset(1)), Some(ByteOffset(0)));
+        assert_eq!(map.prev_cursor_position(ByteOffset(0)), None);
     }
 
     #[test]
@@ -666,10 +674,10 @@ mod tests {
         map.build_index();
 
         // Clicking past end of line should position at end of content
-        assert_eq!(map.screen_to_source_nearest(0, 10), Some(2)); // After 'i'
+        assert_eq!(map.screen_to_source_nearest(0, 10), Some(ByteOffset(2))); // After 'i'
 
         // Screen position for end-of-line offset
-        assert_eq!(map.source_to_screen(2), Some((0, 4))); // One past 'i' column
+        assert_eq!(map.source_to_screen(ByteOffset(2)), Some((0, 4))); // One past 'i' column
     }
 
     #[test]
