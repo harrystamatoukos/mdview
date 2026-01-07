@@ -21,6 +21,7 @@ use crate::primitives::ByteOffset;
 use crate::renderer;
 use crate::selection::Selection;
 use crate::theme::{Theme, LEFT_MARGIN};
+use crate::view::ViewState;
 
 /// Info about a detected list item
 struct ListItemInfo {
@@ -37,8 +38,7 @@ pub struct Pager<'a> {
     // Rendered content
     content: Text<'a>,
     layout_map: LayoutMap,
-    scroll_target: f64,    // Where we want to scroll to
-    scroll_current: f64,   // Animated current position
+    view: ViewState,       // Scroll position and animation
     total_lines: usize,
     theme: Theme,
     // Cursor state for WYSIWYG editing
@@ -69,10 +69,6 @@ pub struct Pager<'a> {
     last_input_time: std::time::Instant,
 }
 
-// Easing factor: higher = snappier, lower = smoother
-const SCROLL_EASING: f64 = 0.3;  // Snappier for more responsive feel
-// Threshold to snap to target (avoid endless micro-animations)
-const SCROLL_SNAP_THRESHOLD: f64 = 0.5;
 // Fast polling duration after input (ms) - keep fast for a while after typing
 const FAST_POLL_DURATION_MS: u128 = 1000;
 // Minimum poll time during active editing (ms) - 60fps for smoothness
@@ -99,8 +95,7 @@ impl<'a> Pager<'a> {
         Self {
             content,
             layout_map,
-            scroll_target: 0.0,
-            scroll_current: 0.0,
+            view: ViewState::new(),
             total_lines,
             theme,
             cursor_source,
@@ -1131,40 +1126,29 @@ impl<'a> Pager<'a> {
     }
 
     fn scroll_up(&mut self, amount: usize) {
-        self.scroll_target = (self.scroll_target - amount as f64).max(0.0);
+        self.view.scroll_up(amount);
     }
 
     fn scroll_down(&mut self, amount: usize, viewport_height: usize) {
-        let max_scroll = self.total_lines.saturating_sub(viewport_height) as f64;
-        self.scroll_target = (self.scroll_target + amount as f64).min(max_scroll);
+        self.view.scroll_down(amount, self.total_lines, viewport_height);
     }
 
     fn scroll_to_top(&mut self) {
-        self.scroll_target = 0.0;
+        self.view.scroll_to_top();
     }
 
     fn scroll_to_bottom(&mut self, viewport_height: usize) {
-        self.scroll_target = self.total_lines.saturating_sub(viewport_height) as f64;
+        self.view.scroll_to_bottom(self.total_lines, viewport_height);
     }
 
     /// Update animation state, returns true if still animating
     fn update_animation(&mut self) -> bool {
-        let diff = self.scroll_target - self.scroll_current;
-
-        if diff.abs() < SCROLL_SNAP_THRESHOLD {
-            // Snap to target when close enough
-            self.scroll_current = self.scroll_target;
-            false
-        } else {
-            // Exponential easing toward target
-            self.scroll_current += diff * SCROLL_EASING;
-            true
-        }
+        self.view.update_animation()
     }
 
     /// Get the current scroll position for rendering
     fn scroll_position(&self) -> usize {
-        self.scroll_current.round() as usize
+        self.view.position()
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1245,19 +1229,9 @@ impl<'a> Pager<'a> {
     fn ensure_cursor_visible_with_viewport(&mut self, viewport_height: usize) {
         if let Some(current) = self.cursor_source {
             if let Some((line, _)) = self.layout_map.source_to_screen(current.get()) {
-                let scroll_pos = self.scroll_position();
-
-                // Add margin to keep cursor away from edges (better UX)
-                let scroll_margin = 3.min(viewport_height / 4);
-
-                // Scroll up if cursor is near top of viewport
-                if line < scroll_pos + scroll_margin {
-                    self.scroll_target = line.saturating_sub(scroll_margin) as f64;
-                }
-                // Scroll down if cursor is near bottom of viewport
-                else if line >= scroll_pos + viewport_height - scroll_margin {
-                    self.scroll_target = (line.saturating_sub(viewport_height - scroll_margin - 1)) as f64;
-                }
+                // Use ViewState's ensure_line_visible with a margin
+                let margin = 3.min(viewport_height / 4);
+                self.view.ensure_line_visible(line, viewport_height, margin);
             }
         }
     }
