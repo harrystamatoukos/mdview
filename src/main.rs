@@ -6,10 +6,11 @@ mod editor;
 mod parser;
 mod pager;
 mod position;
-mod primitives;  // New type-safe coordinate primitives
+mod primitives;
 mod renderer;
 mod selection;
 mod theme;
+mod view;
 mod watcher;
 
 use theme::{Theme, ThemeType};
