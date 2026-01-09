@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use crate::document::Document;
 use crate::parser::{self, Element, Span, SpanKind};
 use crate::position::{FormattingKind, FormattingSpan, LayoutMap, MappedChar};
@@ -161,7 +159,7 @@ fn render_element_mapped(
     theme: &Theme,
 ) {
     match element {
-        Element::Heading { level, text, source } => {
+        Element::Heading { level, spans, .. } => {
             // Spacing above (synthetic)
             let spacing_above = if *level <= 2 { HEADING_SPACING_MAJOR } else { HEADING_SPACING_MINOR };
             for _ in 0..spacing_above {
@@ -178,26 +176,38 @@ fn render_element_mapped(
                 _ => theme.h6(),
             };
 
-            let mut builder = MappedLineBuilder::new();
-            builder.push_synthetic_raw(margin);
+            // Render spans with position tracking; heading style overrides inline styles
+            let (wrapped_lines, formatting_spans) = wrap_spans_styled(spans, width, theme);
 
-            // For H1, we uppercase - chars still map to source but display is uppercase
-            // Use Cow to avoid allocation for non-H1 headings
-            let text_to_render: Cow<str> = if *level == 1 {
-                Cow::Owned(text.to_uppercase())
-            } else {
-                Cow::Borrowed(text)
-            };
+            for fs in formatting_spans {
+                layout_map.push_formatting_span(fs);
+            }
 
-            // Calculate offset to actual heading text (skip markdown syntax)
-            // ATX headings: "# ", "## ", "### " etc. = level + 1 characters
-            // The source span starts at the first #, text starts after "### "
-            let text_start_offset = source.start.get() + (*level as usize) + 1;
-            builder.push_mapped(&text_to_render, text_start_offset, style);
+            for segments in wrapped_lines {
+                let mut builder = MappedLineBuilder::new();
+                builder.push_synthetic_raw(margin);
 
-            let (line, chars) = builder.finish();
-            lines.push(line);
-            layout_map.push_line(chars);
+                for segment in segments {
+                    let text = if *level == 1 {
+                        segment.text.to_ascii_uppercase()
+                    } else {
+                        segment.text.clone()
+                    };
+
+                    for (ch, maybe_offset) in text.chars().zip(segment.char_offsets.iter()) {
+                        if let Some(offset) = maybe_offset {
+                            builder.chars.push(MappedChar::with_source(ch, *offset));
+                        } else {
+                            builder.chars.push(MappedChar::synthetic(ch));
+                        }
+                    }
+                    builder.spans.push(TuiSpan::styled(text, style));
+                }
+
+                let (line, chars) = builder.finish();
+                lines.push(line);
+                layout_map.push_line(chars);
+            }
 
             // Spacing below (synthetic)
             if *level == 1 {
@@ -1037,7 +1047,7 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
                 "\n".repeat(HEADING_SPACING_MINOR)
             };
             if *level == 1 {
-                format!("{}{}{}\n\n", spacing, margin, text.to_uppercase())
+                format!("{}{}{}\n\n", spacing, margin, text.to_ascii_uppercase())
             } else {
                 format!("{}{}{}\n\n", spacing, margin, text)
             }

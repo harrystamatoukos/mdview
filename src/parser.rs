@@ -17,6 +17,7 @@ use crate::primitives::SourceSpan;
 pub enum Element {
     Heading {
         level: u8,
+        spans: Vec<Span>,
         text: String,
         source: SourceSpan,
     },
@@ -137,9 +138,11 @@ where
     match event {
         Event::Start(Tag::Heading { level, .. }) => {
             let start = range.start;
-            let (text, end) = collect_text_until_end_ranged(iter, TagEnd::Heading(level));
+            let (spans, end) = collect_spans_until_end_ranged(iter, TagEnd::Heading(level));
+            let text = spans_to_text(&spans);
             Some(Element::Heading {
                 level: heading_level_to_u8(level),
+                spans,
                 text,
                 source: SourceSpan::from_usize(start, end),
             })
@@ -249,6 +252,23 @@ where
     }
 
     (text, end_pos)
+}
+
+fn spans_to_text(spans: &[Span]) -> String {
+    let mut text = String::new();
+    for span in spans {
+        match &span.kind {
+            SpanKind::Text(t)
+            | SpanKind::Emphasis(t)
+            | SpanKind::Strong(t)
+            | SpanKind::StrongEmphasis(t)
+            | SpanKind::Code(t)
+            | SpanKind::Strikethrough(t) => text.push_str(t),
+            SpanKind::Link { text: link_text, .. } => text.push_str(link_text),
+            SpanKind::SoftBreak | SpanKind::HardBreak => text.push(' '),
+        }
+    }
+    text
 }
 
 /// Collect spans until end tag, returning spans and end position
