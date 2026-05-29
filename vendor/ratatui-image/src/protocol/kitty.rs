@@ -221,9 +221,13 @@ fn render(
 /// automatically by kitty.
 fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool) -> String {
     // mdview patch: zlib compression level for the kitty `o=z` transmit (0-10).
-    // Tuned for the rich reader: compression runs off the UI thread (on the
-    // render worker), so we can favour a stronger ratio over raw speed.
-    const ZLIB_LEVEL: u8 = 6;
+    // Tuned for the rich reader. Compression runs on the render worker, and that
+    // worker's per-band latency is exactly what a fast scroll outruns — so we
+    // favour compress *speed* over ratio. Measured on a real 8M-px band:
+    // L2 ≈ 0.66 MB in ~36 ms vs L6 ≈ 0.63 MB in ~63 ms. The ~3% larger transmit
+    // is invisible on the UI flush, but the ~27 ms saved per band lets the worker
+    // catch up to the viewport noticeably faster after a fling.
+    const ZLIB_LEVEL: u8 = 2;
 
     let (w, h) = (img.width(), img.height());
     let img_rgba8 = img.to_rgba8();

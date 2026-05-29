@@ -546,8 +546,16 @@ fn ui_loop(
             terminal.draw(|f| {
                 f.render_widget(Block::default().style(Style::default().bg(bg)), full);
                 if let Some(b) = chosen {
-                    // Offset of the viewport top within the band.
-                    let offset = (view_top as i64 - b.row0 as i64).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+                    // Offset of the viewport top within the band. When a fully
+                    // covering band isn't ready yet (a fast scroll outran the
+                    // worker), clamp into the band's valid range so its content
+                    // can't slide off-screen into a blank frame — the view
+                    // "sticks" to the nearest rendered content and snaps to the
+                    // exact position the instant the covering band lands. When
+                    // `covered`, this is a no-op: `covers()` already guarantees
+                    // the offset lies in `[0, rows - view_h]`.
+                    let max_off = b.rows.saturating_sub(view_h as u32) as i64;
+                    let offset = (view_top as i64 - b.row0 as i64).clamp(0, max_off) as i16;
                     let x_off = (term_w.saturating_sub(b.cols)) / 2;
                     let img_area = Rect::new(x_off, 0, b.cols.min(term_w), view_h);
                     let position = SignedPosition::from((0, -offset));
