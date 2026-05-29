@@ -1,0 +1,72 @@
+# Vendored copy of ratatui-image 11.0.2 (https://github.com/ratatui/ratatui-image).
+#
+# Why vendored: upstream's kitty graphics transmit (`transmit_virtual` in
+# src/protocol/kitty.rs) sends RAW uncompressed RGBA. For the rich reader's
+# large per-band images (~8M px ≈ 32 MB) that costs ~650 ms to push through the
+# PTY on every band crossing, which is the dominant scroll-jank source.
+#
+# The only functional change vs. upstream is in src/protocol/kitty.rs:
+# zlib-compress the pixel data and add `o=z` to the kitty control data, cutting
+# the per-band transmit by ~20-50x. Everything else is byte-for-byte upstream.
+#
+# Trimmed relative to upstream: the binary, examples, benches, dev-dependencies,
+# the build script, and the chafa features (we never link libchafa). The
+# `primitive` halfblocks fallback is used instead, exactly as upstream does when
+# chafa is disabled.
+
+[package]
+name = "ratatui-image"
+version = "11.0.2"
+edition = "2024"
+rust-version = "1.86.0"
+authors = ["Benjamin Große <ste3ls@gmail.com>"]
+description = "An image widget for ratatui (vendored + zlib kitty transmit for mdview)"
+license = "MIT"
+repository = "https://github.com/ratatui/ratatui-image"
+autobins = false
+autoexamples = false
+autobenches = false
+autotests = false
+
+[lib]
+name = "ratatui_image"
+path = "src/lib.rs"
+
+[features]
+default = ["image-defaults", "crossterm"]
+crossterm = ["ratatui/crossterm"]
+image-defaults = ["image/default"]
+termion = ["ratatui/termion"]
+termwiz = ["ratatui/termwiz"]
+serde = ["dep:serde"]
+tokio = ["dep:tokio"]
+thread-example = []
+# Inert stubs: the upstream source gates libchafa FFI behind these. We never
+# enable them (no build script, no libchafa linkage), but declaring them keeps
+# the upstream `#[cfg(feature = "chafa-*")]` checks recognized so the build stays
+# warning-free. Do NOT enable them — there is no build script to link libchafa.
+chafa-dyn = []
+chafa-static = []
+
+[dependencies]
+image = { version = "^0.25.6", default-features = false, features = ["png"] }
+icy_sixel = { version = "^0.5.0" }
+serde = { version = "^1.0", optional = true, features = ["derive"] }
+base64-simd = { version = "0.8" }
+miniz_oxide = { version = "0.8" }
+rand = { version = "^0.8.5" }
+ratatui = { version = "^0.30.0", default-features = false, features = [] }
+self_cell = "1.2.2"
+thiserror = { version = "1.0.59" }
+tokio = { version = "1.45.1", default-features = false, optional = true, features = ["sync"] }
+
+[target.'cfg(not(windows))'.dependencies]
+rustix = { version = "^0.38.4", features = ["stdio", "termios", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58.0", default-features = false, features = [
+  "std",
+  "Win32_System_Console",
+  "Win32_Storage_FileSystem",
+  "Win32_Security",
+] }

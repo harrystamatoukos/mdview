@@ -1,6 +1,6 @@
 [package]
 name = "mdview"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Harry Stamatoukos"]
 description = "A beautiful terminal markdown viewer with editorial aesthetics"
@@ -32,8 +32,19 @@ anyhow = "1.0"
 cosmic-text = { version = "0.19", optional = true }
 # Disable default features to avoid the chafa C-library dependency; we only
 # need the crossterm integration and image codecs.
-ratatui-image = { version = "11.0", optional = true, default-features = false, features = ["crossterm", "image-defaults"] }
+#
+# Vendored (see vendor/ratatui-image): a one-function patch zlib-compresses the
+# kitty graphics transmit (`o=z`). Upstream sends raw RGBA, which for the rich
+# reader's large per-band images costs ~650 ms per band on the UI thread and is
+# the dominant scroll-jank source. Everything else is byte-for-byte upstream.
+ratatui-image = { path = "vendor/ratatui-image", optional = true, default-features = false, features = ["crossterm", "image-defaults"] }
 image = { version = "0.25", optional = true }
+
+[dev-dependencies]
+# Used by an offline test that verifies a representative rendered band's RGBA
+# compresses far smaller than raw (the premise behind the vendored kitty `o=z`
+# transmit). Same compressor the vendored crate uses, so the ratio is faithful.
+miniz_oxide = "0.8"
 
 [features]
 default = ["rich"]

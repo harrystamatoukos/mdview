@@ -1,14 +1,28 @@
 //! Read-only "rich" reader: displays the document inline via a terminal
 //! graphics protocol and scrolls it smoothly.
 //!
-//! The whole document is laid out, rasterized **once** (downscaled to a bounded
-//! pixel budget, rendered in tiles so memory stays bounded), and transmitted to
-//! the terminal once as a `SlicedProtocol`. Scrolling then only moves a cell
-//! offset (`SlicedImage`) — nothing is ever re-encoded or re-transmitted, so
-//! scrolling is smooth regardless of document length.
+//! ## Why a background worker
+//!
+//! Two costs scale with document length and would otherwise stutter the UI:
+//!
+//! * **Shaping** (cosmic-text layout) — hundreds of ms for a long document.
+//! * **Rasterize + base64-encode** of each multi-megabyte band.
+//!
+//! Both are moved off the UI thread onto a dedicated **render worker** that
+//! owns the `Painter` (and therefore the `FontSystem`, which never crosses a
+//! thread boundary). The UI thread only sends a *target* (which band it wants)
+//! and displays finished `SlicedProtocol`s as they arrive — it never shapes or
+//! encodes, so input and scrolling stay responsive regardless of length.
+//!
+//! The worker shapes **lazily** (top window first → fast first paint), then
+//! trickle-shapes the rest in the background, and **prefetches** the bands on
+//! either side of the current one so crossing a band edge is already paid for.
+//! Within a band, scrolling only moves a cell offset (`SlicedImage`) — nothing
+//! is re-encoded or re-transmitted.
 
 use anyhow::{anyhow, Result};
 use std::io::stdout;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 use crossterm::{
@@ -31,15 +45,29 @@ use ratatui_image::{
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 
-use super::DocStyle;
+use super::{DocStyle, Painter, RichDoc};
 
 const EVENT_POLL_MS: u64 = 100;
+/// Faster poll while waiting for the worker to deliver the band under the
+/// viewport, so the new frame appears the moment it lands.
+const WAIT_POLL_MS: u64 = 16;
 const MAX_EVENTS_PER_FRAME: usize = 64;
-/// Pixel budget for the transmitted image. Raw RGBA, so bytes ≈ pixels × 4.
-/// Sized so typical documents render at full resolution (no downscale →
-/// comfortable text size); only very long documents get scaled down to keep
-/// the one-time transmission bounded.
+/// Pixel budget for one transmitted *band*. Raw RGBA, so bytes ≈ pixels × 4.
+/// The document is shown one band at a time; bands are sized to this budget so
+/// each transmission stays bounded no matter how long the document is.
 const MAX_PIXELS: u64 = 8_000_000;
+/// Lower bound on the width-fit scale, so an extremely narrow terminal can't
+/// blow up the per-band render. Below this the page is centered/clipped instead.
+const MIN_SCALE: f32 = 0.25;
+/// How many elements the worker shapes per background trickle step before
+/// re-checking for higher-priority band requests.
+const SHAPE_CHUNK: usize = 64;
+/// Distinct bands the worker remembers having produced (to skip re-rendering).
+/// Kept smaller than the UI cache so the UI always still holds anything the
+/// worker considers "already produced" — no stale-blank, no needless re-encode.
+const PRODUCED_CAP: usize = 3;
+/// Decoded bands the UI keeps around (LRU by arrival). ≥ current + 2 neighbors.
+const CACHE_CAP: usize = 6;
 
 enum RichEvent {
     Quit,
@@ -105,6 +133,240 @@ pub fn run(markdown: &str) -> Result<()> {
     result
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// UI ⇄ worker protocol
+// ─────────────────────────────────────────────────────────────────────────
+
+/// What the UI currently wants on screen. Sent whenever it changes; the worker
+/// always works toward the latest one. All fields are `Copy`/cheap.
+#[derive(Clone, Copy, PartialEq)]
+struct Target {
+    /// Band top, in document cell-rows at `scale` (an aligned slot).
+    row0: u32,
+    /// Band height in cell-rows (stable; independent of document length).
+    rows: u32,
+    /// `f32::to_bits` of the width-fit scale this target is for.
+    scale_bits: u32,
+    cell_w: u32,
+    cell_h: u32,
+    /// Distance between adjacent band slots (rows minus overlap).
+    stride: u32,
+    /// Largest valid `row0` (last band is pinned to the document bottom).
+    max_row0: u32,
+}
+
+enum Request {
+    SetTarget(Target),
+    Quit,
+}
+
+enum Response {
+    /// A finished, encoded band ready to display.
+    Band {
+        row0: u32,
+        rows: u32,
+        cols: u16,
+        scale_bits: u32,
+        proto: SlicedProtocol,
+        total_h: u32,
+        fully_shaped: bool,
+    },
+    /// Background-shaping progress: the document's height estimate grew (or
+    /// became exact). Lets the UI refine its scroll bounds.
+    Progress { total_h: u32, fully_shaped: bool },
+}
+
+/// A decoded band held by the UI. Scrolling within `[row0, row0 + rows)` only
+/// moves a cell offset; leaving that range switches to another cached band (or
+/// waits for the worker to deliver it).
+struct CachedBand {
+    proto: SlicedProtocol,
+    row0: u32,
+    rows: u32,
+    cols: u16,
+    scale_bits: u32,
+}
+
+impl CachedBand {
+    /// Whether this band fully covers the viewport `[top, top + view_h)`.
+    fn covers(&self, scale_bits: u32, top: u32, view_h: u32) -> bool {
+        self.scale_bits == scale_bits && self.row0 <= top && self.row0 + self.rows >= top + view_h
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Render worker
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Owns the `Painter` (and `FontSystem`) and `RichDoc`. Serves the UI's latest
+/// target band first, then prefetches neighbors, then trickle-shapes the rest
+/// in the background, then blocks until the next request.
+fn render_worker(
+    markdown: String,
+    style: DocStyle,
+    picker: Picker,
+    req_rx: Receiver<Request>,
+    resp_tx: Sender<Response>,
+) {
+    let t0 = std::time::Instant::now();
+    let elements = crate::parser::parse(&markdown);
+    let n_elements = elements.len();
+    let mut painter = Painter::new();
+    let mut doc = painter.begin(elements, &style);
+    perf_log(&format!(
+        "worker init: {} ms (FontSystem + parse, {n_elements} elements, page_w={})",
+        t0.elapsed().as_millis(),
+        doc.page_w
+    ));
+
+    let mut target: Option<Target> = None;
+    // Recency-ordered keys of bands already produced (front = oldest).
+    let mut produced: Vec<(u32, u32)> = Vec::with_capacity(PRODUCED_CAP);
+
+    'main: loop {
+        // 1. Drain all queued requests; keep only the latest target.
+        loop {
+            match req_rx.try_recv() {
+                Ok(Request::Quit) => return,
+                Ok(Request::SetTarget(t)) => target = Some(t),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+
+        if let Some(t) = target {
+            // 2. Serve the target band first (highest priority).
+            let key = (t.row0, t.scale_bits);
+            if !produced.contains(&key) {
+                match render_band(&mut painter, &mut doc, &picker, &t, t.row0) {
+                    Some(resp) => {
+                        let _ = resp_tx.send(resp);
+                    }
+                    None => {
+                        // Target fell past the (now exact) document end; report
+                        // height so the UI re-clamps and picks a valid target.
+                        let _ = resp_tx.send(Response::Progress {
+                            total_h: doc.total_h,
+                            fully_shaped: doc.fully_shaped(),
+                        });
+                    }
+                }
+                remember(&mut produced, key);
+                continue 'main; // re-check for a newer target before doing more
+            }
+
+            // 3. Target satisfied → prefetch the neighboring slots.
+            for nrow0 in neighbor_row0s(&t) {
+                let nkey = (nrow0, t.scale_bits);
+                if !produced.contains(&nkey) {
+                    if let Some(resp) = render_band(&mut painter, &mut doc, &picker, &t, nrow0) {
+                        let _ = resp_tx.send(resp);
+                    }
+                    remember(&mut produced, nkey);
+                    continue 'main;
+                }
+            }
+        }
+
+        // 4. Nothing urgent → trickle-shape the rest in the background.
+        if !doc.fully_shaped() {
+            painter.shape_step(&mut doc, SHAPE_CHUNK);
+            let _ = resp_tx.send(Response::Progress {
+                total_h: doc.total_h,
+                fully_shaped: doc.fully_shaped(),
+            });
+            continue 'main;
+        }
+
+        // 5. Idle (shaped, target served, prefetched) → block for next request.
+        match req_rx.recv() {
+            Ok(Request::SetTarget(t)) => target = Some(t),
+            Ok(Request::Quit) | Err(_) => return,
+        }
+    }
+}
+
+/// Render + encode one band at cell-row `row0` for the given target geometry.
+/// Returns `None` if `row0` lies past the (fully-shaped) document end.
+fn render_band(
+    painter: &mut Painter,
+    doc: &mut RichDoc,
+    picker: &Picker,
+    t: &Target,
+    row0: u32,
+) -> Option<Response> {
+    let scale = f32::from_bits(t.scale_bits);
+    let cell_h = t.cell_h as u64;
+    let cell_w = t.cell_w;
+
+    // Map the band's cell range back to a document-pixel window.
+    let y0_doc = ((row0 as u64 * cell_h) as f64 / scale as f64).round() as u32;
+    let y_bottom = (((row0 + t.rows) as u64 * cell_h) as f64 / scale as f64).round() as u32;
+    // Ensure shaping has reached the band bottom (may make total_h exact).
+    painter.ensure_shaped_to(doc, y_bottom);
+
+    if y0_doc >= doc.total_h {
+        return None; // past the end
+    }
+    let win_h_doc = ((t.rows as u64 * cell_h) as f64 / scale as f64).round() as u32;
+    let win_h_doc = win_h_doc.min(doc.total_h.saturating_sub(y0_doc)).max(1);
+
+    let tload = std::time::Instant::now();
+    let img = painter.render_window_scaled(doc, y0_doc, win_h_doc, scale);
+    let (bw, bh) = (img.width(), img.height());
+    let cols = bw.div_ceil(cell_w).max(1) as u16;
+    let rows = bh.div_ceil(t.cell_h).max(1);
+    let proto = SlicedProtocol::new(
+        picker,
+        DynamicImage::ImageRgba8(img),
+        Some(Size::new(cols, rows as u16)),
+    )
+    .ok()?;
+    perf_log(&format!(
+        "band render: {} ms (s={scale:.3}, row0={row0}, img={bw}x{bh}, cols={cols}, rows={rows})",
+        tload.elapsed().as_millis()
+    ));
+
+    Some(Response::Band {
+        row0,
+        rows,
+        cols,
+        scale_bits: t.scale_bits,
+        proto,
+        total_h: doc.total_h,
+        fully_shaped: doc.fully_shaped(),
+    })
+}
+
+/// The neighboring band slots to prefetch (down first — the common direction).
+fn neighbor_row0s(t: &Target) -> Vec<u32> {
+    let mut v = Vec::with_capacity(2);
+    let down = (t.row0 + t.stride).min(t.max_row0);
+    if down != t.row0 {
+        v.push(down);
+    }
+    if t.row0 >= t.stride {
+        let up = (t.row0 - t.stride).min(t.max_row0);
+        if up != t.row0 && !v.contains(&up) {
+            v.push(up);
+        }
+    }
+    v
+}
+
+/// Record a produced band key, keeping only the most recent `PRODUCED_CAP`.
+fn remember(produced: &mut Vec<(u32, u32)>, key: (u32, u32)) {
+    produced.retain(|&k| k != key);
+    produced.push(key);
+    if produced.len() > PRODUCED_CAP {
+        produced.remove(0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// UI loop
+// ─────────────────────────────────────────────────────────────────────────
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     picker: &Picker,
@@ -112,49 +374,50 @@ fn run_loop(
 ) -> Result<()> {
     let style = DocStyle::light();
     let bg = Color::Rgb(style.bg.0, style.bg.1, style.bg.2);
-
-    // Lay out + rasterize the whole document once, downscaled to the budget.
-    let t0 = std::time::Instant::now();
-    let (mut painter, mut doc) = super::lay_out_document(markdown, &style);
-    perf_log(&format!(
-        "layout: {} ms (page_w={}, total_h={})",
-        t0.elapsed().as_millis(),
-        doc.page_w,
-        doc.total_h
-    ));
-
-    let t1 = std::time::Instant::now();
-    let (img, q) = painter.render_scaled(&mut doc, MAX_PIXELS);
-    let (iw, ih) = (img.width(), img.height());
-    perf_log(&format!(
-        "render_scaled: {} ms (q={q:.3}, img={iw}x{ih} = {} px)",
-        t1.elapsed().as_millis(),
-        iw as u64 * ih as u64
-    ));
+    // page_w is deterministic from the style — no need to wait on the worker.
+    let page_w = style.content_px + style.margin_px * 2;
 
     let fs = picker.font_size();
     let cell_w = fs.width.max(1) as u32;
     let cell_h = fs.height.max(1) as u32;
 
-    // Transmit ONCE. Cell dimensions match the image's own pixel size so the
-    // protocol doesn't rescale it.
-    let cols = iw.div_ceil(cell_w).max(1) as u16;
-    let rows = ih.div_ceil(cell_h).max(1) as u16;
-    let t2 = std::time::Instant::now();
-    let proto = SlicedProtocol::new(
-        picker,
-        DynamicImage::ImageRgba8(img),
-        Some(Size::new(cols, rows)),
-    )?;
-    let total_rows = proto.size().height;
-    perf_log(&format!(
-        "protocol build (encode): {} ms (cell={cell_w}x{cell_h}, cols={cols}, rows={rows}, total_rows={total_rows})",
-        t2.elapsed().as_millis()
-    ));
+    // Spawn the render worker (owns the Painter / FontSystem).
+    let (req_tx, req_rx) = mpsc::channel::<Request>();
+    let (resp_tx, resp_rx) = mpsc::channel::<Response>();
+    let worker = {
+        let markdown = markdown.to_string();
+        let style = style.clone();
+        let picker = picker.clone();
+        std::thread::spawn(move || render_worker(markdown, style, picker, req_rx, resp_tx))
+    };
 
+    let result = ui_loop(
+        terminal, bg, page_w, cell_w, cell_h, &req_tx, &resp_rx,
+    );
+
+    // Tell the worker to exit (best-effort) and let it wind down.
+    let _ = req_tx.send(Request::Quit);
+    drop(req_tx);
+    let _ = worker.join();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ui_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    bg: Color,
+    page_w: u32,
+    cell_w: u32,
+    cell_h: u32,
+    req_tx: &Sender<Request>,
+    resp_rx: &Receiver<Response>,
+) -> Result<()> {
+    let mut scroll_rows: u32 = 0;
+    let mut doc_total_h: u32 = 0; // unknown until the worker reports
+    let mut fully_shaped = false;
+    let mut cache: Vec<CachedBand> = Vec::new();
+    let mut last_target: Option<Target> = None;
     let mut frame: u64 = 0;
-
-    let mut scroll_rows: u16 = 0;
     let mut dirty = true;
 
     loop {
@@ -166,47 +429,148 @@ fn run_loop(
             continue;
         }
 
-        let max_scroll = total_rows.saturating_sub(view_h);
+        // Width-fit scale: largest (never magnified past full resolution) while
+        // the page fits the terminal width. Independent of document length.
+        let term_w_px = term_w as u32 * cell_w;
+        let s = (term_w_px as f32 / page_w as f32).clamp(MIN_SCALE, 1.0);
+        let scale_bits = s.to_bits();
+
+        // Document height as scrollable cell-rows at this scale (0 until known).
+        let doc_rows = if doc_total_h > 0 {
+            ((doc_total_h as f32 * s).round() as u32)
+                .div_ceil(cell_h)
+                .max(1)
+        } else {
+            view_h as u32
+        };
+        let max_scroll = doc_rows.saturating_sub(view_h as u32);
         if scroll_rows > max_scroll {
             scroll_rows = max_scroll;
         }
 
-        if dirty {
-            let x_off = (term_w.saturating_sub(cols)) / 2;
-            let img_area = Rect::new(x_off, 0, cols.min(term_w), view_h);
-            let full = Rect::new(0, 0, term_w, view_h);
-            let position = SignedPosition::from((0, -(scroll_rows as i16)));
+        // Band geometry — stable (independent of document length) so a band's
+        // identity doesn't change as the height estimate is refined.
+        let sw = ((page_w as f32 * s).round() as u32).max(1);
+        let band_rows = ((MAX_PIXELS / (sw as u64 * cell_h as u64)) as u32).max(view_h as u32 + 4);
+        let max_row0 = doc_rows.saturating_sub(band_rows);
+        // Adjacent bands overlap by at least a viewport, so any viewport fits
+        // entirely inside exactly one slot.
+        let stride = band_rows.saturating_sub(view_h as u32 + 2).max(1);
+        let band_index = scroll_rows / stride;
+        let target_row0 = (band_index * stride).min(max_row0);
 
+        let target = Target {
+            row0: target_row0,
+            rows: band_rows,
+            scale_bits,
+            cell_w,
+            cell_h,
+            stride,
+            max_row0,
+        };
+
+        // 1. Drain worker responses.
+        loop {
+            match resp_rx.try_recv() {
+                Ok(Response::Progress { total_h, fully_shaped: fs }) => {
+                    doc_total_h = total_h;
+                    fully_shaped = fs;
+                    dirty = true;
+                }
+                Ok(Response::Band {
+                    row0,
+                    rows,
+                    cols,
+                    scale_bits,
+                    proto,
+                    total_h,
+                    fully_shaped: fs,
+                }) => {
+                    doc_total_h = total_h;
+                    fully_shaped = fs;
+                    insert_band(
+                        &mut cache,
+                        CachedBand { proto, row0, rows, cols, scale_bits },
+                    );
+                    dirty = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+
+        // 2. Tell the worker what we want, when it changes.
+        if last_target != Some(target) {
+            let _ = req_tx.send(Request::SetTarget(target));
+            last_target = Some(target);
+            dirty = true;
+        }
+
+        // 3. Choose the band to display: one that fully covers the viewport at
+        //    this scale, else the nearest same-scale band (partial), else none.
+        let view_top = scroll_rows;
+        let covering = cache
+            .iter()
+            .find(|b| b.covers(scale_bits, view_top, view_h as u32));
+        let chosen = covering.or_else(|| {
+            cache
+                .iter()
+                .filter(|b| b.scale_bits == scale_bits)
+                .min_by_key(|b| b.row0.abs_diff(view_top))
+        });
+        let covered = covering.is_some();
+
+        // 4. Draw.
+        if dirty {
             let pct = if max_scroll == 0 {
                 100
             } else {
                 (scroll_rows as f32 / max_scroll as f32 * 100.0).round() as u32
             };
+            let state = if chosen.is_none() {
+                " · loading"
+            } else if !covered {
+                " · rendering"
+            } else if !fully_shaped {
+                " · indexing"
+            } else {
+                ""
+            };
             let status = format!(
-                " mdview · reading · {pct}%    ↑/↓ j/k scroll · space page · g/G top/bottom · q quit "
+                " mdview · reading · {pct}%{state}    ↑/↓ j/k scroll · space page · g/G top/bottom · q quit "
             );
             let status_rect = Rect::new(0, term_h.saturating_sub(1), term_w, 1);
+            let full = Rect::new(0, 0, term_w, view_h);
 
             let td = std::time::Instant::now();
             terminal.draw(|f| {
                 f.render_widget(Block::default().style(Style::default().bg(bg)), full);
-                f.render_widget(SlicedImage::new(&proto, position), img_area);
+                if let Some(b) = chosen {
+                    // Offset of the viewport top within the band.
+                    let offset = (view_top as i64 - b.row0 as i64).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+                    let x_off = (term_w.saturating_sub(b.cols)) / 2;
+                    let img_area = Rect::new(x_off, 0, b.cols.min(term_w), view_h);
+                    let position = SignedPosition::from((0, -offset));
+                    f.render_widget(SlicedImage::new(&b.proto, position), img_area);
+                }
                 f.render_widget(
-                    Paragraph::new(status).style(Style::default().fg(Color::Rgb(120, 120, 120)).bg(bg)),
+                    Paragraph::new(status)
+                        .style(Style::default().fg(Color::Rgb(120, 120, 120)).bg(bg)),
                     status_rect,
                 );
             })?;
             frame += 1;
             perf_log(&format!(
-                "draw #{frame}: {} ms (scroll_rows={scroll_rows})",
+                "draw #{frame}: {} ms (scroll_rows={scroll_rows}, covered={covered})",
                 td.elapsed().as_millis()
             ));
             dirty = false;
         }
 
-        let page = view_h.saturating_sub(2).max(1);
-
-        if event::poll(Duration::from_millis(EVENT_POLL_MS))? {
+        // 5. Input. Poll faster while waiting for the covering band to arrive.
+        let page = view_h.saturating_sub(2).max(1) as u32;
+        let poll_ms = if covered { EVENT_POLL_MS } else { WAIT_POLL_MS };
+        if event::poll(Duration::from_millis(poll_ms))? {
             for _ in 0..MAX_EVENTS_PER_FRAME {
                 match handle_event(event::read()?, &mut scroll_rows, max_scroll, page) {
                     RichEvent::Quit => return Ok(()),
@@ -221,7 +585,16 @@ fn run_loop(
     }
 }
 
-fn handle_event(input: Event, scroll: &mut u16, max_scroll: u16, page: u16) -> RichEvent {
+/// Insert a band into the UI cache (LRU by arrival; dedup by key).
+fn insert_band(cache: &mut Vec<CachedBand>, band: CachedBand) {
+    cache.retain(|b| !(b.row0 == band.row0 && b.scale_bits == band.scale_bits));
+    cache.push(band);
+    if cache.len() > CACHE_CAP {
+        cache.remove(0);
+    }
+}
+
+fn handle_event(input: Event, scroll: &mut u32, max_scroll: u32, page: u32) -> RichEvent {
     match input {
         Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
             KeyCode::Char('q') | KeyCode::Esc => RichEvent::Quit,
@@ -264,5 +637,167 @@ fn handle_event(input: Event, scroll: &mut u16, max_scroll: u16, page: u16) -> R
         },
         Event::Resize(_, _) => RichEvent::Changed,
         _ => RichEvent::Ignored,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a moderately structured document so shaping touches headings,
+    /// paragraphs, lists, code, and quotes.
+    fn sample_markdown(reps: usize) -> String {
+        let unit = "# Heading One\n\nA paragraph with **bold**, *italic*, and `code` spans \
+that wraps across the measure to exercise line breaking.\n\n\
+- first bullet\n- second bullet\n\n> a quoted line\n\n\
+```\nfn main() {}\n```\n\n## Heading Two\n\nClosing paragraph.\n\n";
+        unit.repeat(reps)
+    }
+
+    fn headless_picker() -> Picker {
+        // No TTY in tests; halfblocks avoids the terminal query. (The internal
+        // font size is irrelevant — we always pass an explicit cell Size.)
+        Picker::halfblocks()
+    }
+
+    /// The worker must deliver a usable band for a target, report a height, and
+    /// shut down cleanly — exercising the full channel round-trip without a
+    /// terminal (the part the offline PNG path can't cover).
+    #[test]
+    fn worker_serves_band_and_shuts_down() {
+        let md = sample_markdown(40);
+        let style = DocStyle::light();
+        let (cell_w, cell_h) = (8u32, 16u32);
+        let scale = 0.5f32;
+
+        let (req_tx, req_rx) = mpsc::channel::<Request>();
+        let (resp_tx, resp_rx) = mpsc::channel::<Response>();
+        let handle = {
+            let style = style.clone();
+            let picker = headless_picker();
+            std::thread::spawn(move || render_worker(md, style, picker, req_rx, resp_tx))
+        };
+
+        let target = Target {
+            row0: 0,
+            rows: 80,
+            scale_bits: scale.to_bits(),
+            cell_w,
+            cell_h,
+            stride: 60,
+            max_row0: 10_000, // generous; the band clamps to real content
+        };
+        req_tx.send(Request::SetTarget(target)).unwrap();
+
+        // Progress messages may precede the band; wait until a Band arrives.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut got_band = false;
+        while std::time::Instant::now() < deadline {
+            match resp_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(Response::Band { rows, cols, total_h, scale_bits, row0, .. }) => {
+                    assert_eq!(row0, 0);
+                    assert_eq!(scale_bits, scale.to_bits());
+                    assert!(cols > 0, "band should have a positive cell width");
+                    assert!(rows > 0, "band should have a positive cell height");
+                    assert!(total_h > 0, "document height should be reported");
+                    got_band = true;
+                    break;
+                }
+                Ok(Response::Progress { total_h, .. }) => {
+                    assert!(total_h > 0);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(got_band, "worker never produced a band");
+
+        req_tx.send(Request::Quit).unwrap();
+        handle.join().expect("worker thread should exit cleanly");
+    }
+
+    /// A target past the end of the document must not hang or panic: the worker
+    /// reports the (now exact) height instead of a band.
+    #[test]
+    fn worker_handles_target_past_end() {
+        let md = sample_markdown(2); // short doc
+        let style = DocStyle::light();
+
+        let (req_tx, req_rx) = mpsc::channel::<Request>();
+        let (resp_tx, resp_rx) = mpsc::channel::<Response>();
+        let handle = {
+            let style = style.clone();
+            let picker = headless_picker();
+            std::thread::spawn(move || render_worker(md, style, picker, req_rx, resp_tx))
+        };
+
+        // row0 far below any real content.
+        let target = Target {
+            row0: 1_000_000,
+            rows: 80,
+            scale_bits: 0.5f32.to_bits(),
+            cell_w: 8,
+            cell_h: 16,
+            stride: 60,
+            max_row0: 1_000_000,
+        };
+        req_tx.send(Request::SetTarget(target)).unwrap();
+
+        // We should still get a height report (Progress, or a clamped Band) and
+        // be able to shut down — the key property is "no hang/panic".
+        let resp = resp_rx.recv_timeout(Duration::from_secs(20));
+        assert!(resp.is_ok(), "worker should respond even for an out-of-range target");
+
+        req_tx.send(Request::Quit).unwrap();
+        handle.join().expect("worker thread should exit cleanly");
+    }
+
+    #[test]
+    fn neighbors_are_clamped_and_distinct() {
+        // Middle band: both neighbors valid and distinct.
+        let t = Target { row0: 100, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
+        let mut n = neighbor_row0s(&t);
+        n.sort_unstable();
+        assert_eq!(n, vec![40, 160]);
+
+        // Top band: no upward neighbor.
+        let t = Target { row0: 0, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
+        assert_eq!(neighbor_row0s(&t), vec![60]);
+
+        // Bottom band (row0 == max_row0): downward neighbor clamps away, only up.
+        let t = Target { row0: 500, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
+        assert_eq!(neighbor_row0s(&t), vec![440]);
+    }
+
+    #[test]
+    fn cache_is_lru_with_dedup() {
+        let mk = |row0: u32| CachedBand {
+            // A trivial 1x1 protocol via the headless picker.
+            proto: SlicedProtocol::new(
+                &headless_picker(),
+                DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 16, image::Rgba([255, 255, 255, 255]))),
+                Some(Size::new(1, 1)),
+            )
+            .unwrap(),
+            row0,
+            rows: 80,
+            cols: 1,
+            scale_bits: 0,
+        };
+        let mut cache: Vec<CachedBand> = Vec::new();
+        for i in 0..(CACHE_CAP as u32 + 2) {
+            insert_band(&mut cache, mk(i * 10));
+        }
+        assert_eq!(cache.len(), CACHE_CAP, "cache is capped");
+        // Oldest two evicted; newest retained.
+        assert!(cache.iter().any(|b| b.row0 == (CACHE_CAP as u32 + 1) * 10));
+        assert!(!cache.iter().any(|b| b.row0 == 0));
+
+        // Re-inserting an existing key dedups (no growth, moves to newest).
+        let before = cache.len();
+        let keep = cache[cache.len() - 1].row0;
+        insert_band(&mut cache, mk(keep));
+        assert_eq!(cache.len(), before, "dedup keeps length stable");
+        assert_eq!(cache.last().unwrap().row0, keep, "re-inserted band is newest");
     }
 }

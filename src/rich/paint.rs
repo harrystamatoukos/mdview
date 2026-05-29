@@ -212,16 +212,40 @@ struct Placed {
     decorations: Vec<Decoration>,
 }
 
-/// A fully laid-out document: every block is shaped and positioned, but NOT
-/// rasterized. Rasterization happens on demand for a vertical window, so memory
-/// and encode cost stay bounded regardless of document length.
+/// A laid-out document. Shaping happens **incrementally** (one top-level
+/// element at a time, top to bottom) so first paint only pays for the visible
+/// window; the rest is shaped lazily/in the background. Rasterization likewise
+/// happens on demand for a vertical window, so memory and encode cost stay
+/// bounded regardless of document length.
 pub struct RichDoc {
     pub page_w: u32,
+    /// Exact once [`RichDoc::fully_shaped`]; until then an estimate (refined as
+    /// shaping progresses) so scroll math has a stable target without paying
+    /// the full shaping cost up front.
     pub total_h: u32,
     bg: Rgb,
     ink: Rgb,
     margin_px: u32,
+    /// Blocks shaped + positioned so far (document top downward).
     blocks: Vec<Placed>,
+    // ── Incremental shaping state ──
+    /// Parsed top-level elements, shaped on demand one at a time.
+    elements: Vec<Element>,
+    style: DocStyle,
+    /// Index of the next top-level element to shape.
+    next_el: usize,
+    /// Running bottom (page px) of the last positioned block — where the next
+    /// block starts, before its `space_before`. Includes the top pad.
+    shaped_h: u32,
+    /// True once every element has been shaped; `total_h` is then exact.
+    fully_shaped: bool,
+}
+
+impl RichDoc {
+    /// Whether every element has been shaped (so `total_h` is exact).
+    pub fn fully_shaped(&self) -> bool {
+        self.fully_shaped
+    }
 }
 
 impl Painter {
@@ -232,16 +256,91 @@ impl Painter {
         }
     }
 
-    /// Lay out (shape + position) the whole document without rasterizing.
-    pub fn layout(&mut self, elements: &[Element], st: &DocStyle) -> RichDoc {
-        let mut blocks: Vec<Block> = Vec::new();
-        self.lay_out(elements, st, st.content_px, 0, &mut blocks, true);
+    /// Begin a document: record the parsed elements + style but shape nothing
+    /// yet. Cheap — actual shaping happens lazily via [`ensure_shaped_to`] /
+    /// [`ensure_fully_shaped`], so first paint need only shape the top window.
+    ///
+    /// [`ensure_shaped_to`]: Painter::ensure_shaped_to
+    /// [`ensure_fully_shaped`]: Painter::ensure_fully_shaped
+    pub fn begin(&self, elements: Vec<Element>, st: &DocStyle) -> RichDoc {
+        RichDoc {
+            page_w: st.content_px + st.margin_px * 2,
+            // Minimal until the first element is shaped; refined as we go.
+            total_h: (st.pad_px * 2).max(1),
+            bg: st.bg,
+            ink: st.ink,
+            margin_px: st.margin_px,
+            blocks: Vec::new(),
+            elements,
+            style: st.clone(),
+            next_el: 0,
+            shaped_h: st.pad_px,
+            fully_shaped: false,
+        }
+    }
 
-        let mut placed = Vec::with_capacity(blocks.len());
-        let mut y = st.pad_px;
+    /// Lay out (shape + position) the WHOLE document. Convenience for callers
+    /// that need the full page immediately (e.g. PNG export). Output is
+    /// identical to shaping incrementally — top-level elements are independent.
+    pub fn layout(&mut self, elements: &[Element], st: &DocStyle) -> RichDoc {
+        let mut doc = self.begin(elements.to_vec(), st);
+        self.ensure_fully_shaped(&mut doc);
+        doc
+    }
+
+    /// Shape (and position) elements until the document is shaped at least down
+    /// to page-pixel `y_target`, or fully shaped. Cheap no-op once already past
+    /// `y_target`.
+    pub fn ensure_shaped_to(&mut self, doc: &mut RichDoc, y_target: u32) {
+        while !doc.fully_shaped && doc.shaped_h < y_target {
+            self.shape_one(doc);
+        }
+    }
+
+    /// Shape (and position) every remaining element. After this, `total_h` is
+    /// exact.
+    pub fn ensure_fully_shaped(&mut self, doc: &mut RichDoc) {
+        while !doc.fully_shaped {
+            self.shape_one(doc);
+        }
+    }
+
+    /// Shape up to `max_elements` more elements, then return — a background
+    /// trickle that stays responsive to higher-priority work between chunks.
+    pub fn shape_step(&mut self, doc: &mut RichDoc, max_elements: usize) {
+        for _ in 0..max_elements {
+            if doc.fully_shaped {
+                break;
+            }
+            self.shape_one(doc);
+        }
+    }
+
+    /// Shape one top-level element, append its positioned blocks, and advance
+    /// the running height. Updates `total_h` (exact when done, else estimate).
+    fn shape_one(&mut self, doc: &mut RichDoc) {
+        let i = doc.next_el;
+        if i >= doc.elements.len() {
+            doc.fully_shaped = true;
+            return;
+        }
+
+        // Shape this element in isolation. Top-level elements are independent,
+        // so the only cross-element rule — the first heading gets no space
+        // before it — is reproduced by passing `top_level = (i == 0)`.
+        let mut blocks: Vec<Block> = Vec::new();
+        {
+            let st = &doc.style;
+            let el = &doc.elements[i];
+            self.lay_out(std::slice::from_ref(el), st, st.content_px, 0, &mut blocks, i == 0);
+        }
+
+        // Position the new blocks below what's already placed.
+        let pad = doc.style.pad_px;
+        let mut y = doc.shaped_h;
         for b in blocks {
             y += b.space_before;
-            placed.push(Placed {
+            doc.blocks.push(Placed {
                 buffer: b.buffer,
                 y_top: y,
                 height: b.height,
@@ -250,15 +349,21 @@ impl Painter {
             });
             y += b.height;
         }
-        let total = (y + st.pad_px).max(1);
+        doc.shaped_h = y;
+        doc.next_el += 1;
 
-        RichDoc {
-            page_w: st.content_px + st.margin_px * 2,
-            total_h: total,
-            bg: st.bg,
-            ink: st.ink,
-            margin_px: st.margin_px,
-            blocks: placed,
+        if doc.next_el >= doc.elements.len() {
+            doc.fully_shaped = true;
+            doc.total_h = (doc.shaped_h + pad).max(1);
+        } else {
+            // Estimate the remainder from the average element height so far, so
+            // the scroll-clamp/scrollbar has a stable (if approximate) target
+            // until background shaping finishes.
+            let shaped = doc.next_el as u32;
+            let content_h = doc.shaped_h.saturating_sub(pad);
+            let avg = (content_h / shaped.max(1)).max(1);
+            let remaining = (doc.elements.len() - doc.next_el) as u32;
+            doc.total_h = (doc.shaped_h + avg * remaining + pad).max(1);
         }
     }
 
@@ -270,6 +375,7 @@ impl Painter {
     /// This is what the interactive reader transmits — once — so scrolling never
     /// re-encodes or re-transmits anything.
     pub fn render_scaled(&mut self, doc: &mut RichDoc, max_pixels: u64) -> (RgbaImage, f32) {
+        self.ensure_fully_shaped(doc); // need exact total_h to size the target
         let total_px = doc.page_w as u64 * doc.total_h as u64;
         let q = if total_px > max_pixels {
             (max_pixels as f64 / total_px as f64).sqrt() as f32
@@ -301,11 +407,54 @@ impl Painter {
         (target, q)
     }
 
+    /// Rasterize the page-pixel range `[y0, y0 + win_h)` and scale it by
+    /// `scale` (≤ 1.0), producing a `round(page_w·scale) × round(win_h·scale)`
+    /// bitmap. Rendered in vertical tiles so peak memory stays bounded
+    /// regardless of how tall the requested window is.
+    ///
+    /// Unlike [`render_scaled`], the scale is chosen by the caller (from the
+    /// terminal width), so on-screen text size is independent of document
+    /// length — long documents render at the same comfortable size as short
+    /// ones, with off-screen regions rendered on demand while scrolling.
+    pub fn render_window_scaled(
+        &mut self,
+        doc: &mut RichDoc,
+        y0: u32,
+        win_h: u32,
+        scale: f32,
+    ) -> RgbaImage {
+        let win_h = win_h.max(1);
+        let out_w = ((doc.page_w as f32 * scale).round() as u32).max(1);
+        let out_h = ((win_h as f32 * scale).round() as u32).max(1);
+        let bg = Rgba([doc.bg.0, doc.bg.1, doc.bg.2, 255]);
+        let mut target = RgbaImage::from_pixel(out_w, out_h, bg);
+
+        let unscaled = (scale - 1.0).abs() < f32::EPSILON;
+        const TILE: u32 = 4096; // source pixels per tile
+        let mut y = 0u32;
+        while y < win_h {
+            let h = TILE.min(win_h - y);
+            let src = self.render_window(doc, y0 + y, h); // page_w × h, full resolution
+            let dy = (y as f32 * scale).round() as u32;
+            if unscaled {
+                imageops::overlay(&mut target, &src, 0, dy as i64);
+            } else {
+                let dh = ((h as f32 * scale).round() as u32).max(1);
+                let resized = imageops::resize(&src, out_w, dh, FilterType::Triangle);
+                imageops::overlay(&mut target, &resized, 0, dy as i64);
+            }
+            y += h;
+        }
+
+        target
+    }
+
     /// Rasterize only the page-pixel range `[y0, y0 + win_h)` into a bitmap of
     /// size `page_w × win_h`. Blocks outside the range are skipped.
     pub fn render_window(&mut self, doc: &mut RichDoc, y0: u32, win_h: u32) -> RgbaImage {
-        let page_w = doc.page_w;
         let win_h = win_h.max(1);
+        self.ensure_shaped_to(doc, y0 + win_h); // shape any not-yet-shaped rows
+        let page_w = doc.page_w;
         let bg = Rgba([doc.bg.0, doc.bg.1, doc.bg.2, 255]);
         let mut img = RgbaImage::from_pixel(page_w, win_h, bg);
         let y1 = y0 + win_h;
@@ -646,6 +795,85 @@ fn fill_rect(img: &mut RgbaImage, x: i32, y: i32, w: u32, h: u32, color: Rgb) {
                 continue;
             }
             img.put_pixel(cx as u32, cy as u32, px);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Representative long-form markdown — the mix of headings, prose, lists,
+    /// quotes and code the rich reader actually renders.
+    fn sample_markdown(sections: usize) -> String {
+        let mut s = String::from(
+            "# The Rich Reader\n\nAn editorial markdown reading experience with real typography.\n\n",
+        );
+        for i in 0..sections {
+            s.push_str(&format!("## Section {i}: on typography\n\n"));
+            s.push_str(
+                "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod \
+                 tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, \
+                 quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo \
+                 consequat. Duis aute irure dolor in reprehenderit in voluptate velit.\n\n",
+            );
+            s.push_str("- First point worth making here\n- Second supporting detail to consider\n- Third and final observation\n\n");
+            s.push_str("> A pulled quote that adds emphasis and a different visual texture.\n\n");
+            s.push_str("```\nfn main() {\n    println!(\"hello, world\");\n}\n```\n\n");
+        }
+        s
+    }
+
+    /// Render a representative band of roughly `px_budget` pixels and return its
+    /// dimensions plus raw RGBA bytes.
+    fn render_band(px_budget: u32) -> (u32, u32, Vec<u8>) {
+        let md = sample_markdown(40);
+        let style = DocStyle::light();
+        let (mut painter, mut doc) = crate::rich::lay_out_document(&md, &style);
+        let page_w = doc.page_w;
+        let win_h = (px_budget / page_w).max(1);
+        let img = painter.render_window(&mut doc, 0, win_h);
+        (page_w, win_h, img.into_raw())
+    }
+
+    /// Fast premise guard: a representative rendered band's RGBA must compress
+    /// dramatically. This is the whole reason the vendored kitty `o=z` transmit
+    /// is cheap — if rendered content ever stops being highly compressible (e.g.
+    /// a photographic background), this fails and the scroll-perf assumption is
+    /// no longer valid.
+    #[test]
+    fn band_rgba_is_highly_compressible() {
+        let (_w, _h, raw) = render_band(2_000_000);
+        let c = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
+        assert!(
+            c.len() * 5 < raw.len(),
+            "expected >5x compression of a rendered band, raw={} compressed={}",
+            raw.len(),
+            c.len(),
+        );
+    }
+
+    /// Perf exploration (ignored by default). Run for realistic numbers with:
+    ///   cargo test --release -- --ignored --nocapture band_compression_table
+    #[test]
+    #[ignore = "perf exploration; prints a table — run with --release --nocapture"]
+    fn band_compression_table() {
+        let (page_w, win_h, raw) = render_band(8_000_000);
+        println!(
+            "\nband {page_w}x{win_h} = {} px   raw RGBA = {:.1} MB",
+            page_w * win_h,
+            raw.len() as f64 / 1e6,
+        );
+        for level in [1u8, 2, 4, 6, 9] {
+            let t = Instant::now();
+            let c = miniz_oxide::deflate::compress_to_vec_zlib(&raw, level);
+            let ms = t.elapsed().as_millis();
+            println!(
+                "  zlib L{level}: {:.2} MB   {:.0}x smaller   {ms} ms",
+                c.len() as f64 / 1e6,
+                raw.len() as f64 / c.len() as f64,
+            );
         }
     }
 }

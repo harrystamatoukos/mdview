@@ -1364,13 +1364,14 @@ dependencies = [
 
 [[package]]
 name = "mdview"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
  "cosmic-text",
  "crossterm",
  "image",
+ "miniz_oxide",
  "notify",
  "pulldown-cmark",
  "ratatui",
@@ -2073,12 +2074,11 @@ dependencies = [
 [[package]]
 name = "ratatui-image"
 version = "11.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "535e2a5f434ea3308977e6664b4386c3d663951a222e338cb7480d8742fe7773"
 dependencies = [
  "base64-simd",
  "icy_sixel",
  "image",
+ "miniz_oxide",
  "rand 0.8.6",
  "ratatui",
  "rustix 0.38.44",

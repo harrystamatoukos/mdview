@@ -32,8 +32,9 @@ pub fn lay_out_document(markdown: &str, style: &DocStyle) -> (Painter, RichDoc) 
 pub fn export_png(markdown: &str, out: &Path) -> Result<()> {
     let style = DocStyle::light();
     let (mut painter, mut doc) = lay_out_document(markdown, &style);
-    let total_h = doc.total_h;
-    let img = painter.render_window(&mut doc, 0, total_h);
+    // Whole document into one image, downscaled to a bounded pixel budget and
+    // rendered in tiles so even very long documents don't exhaust memory.
+    let (img, _scale) = painter.render_scaled(&mut doc, 8_000_000);
     img.save(out)?;
     Ok(())
 }
