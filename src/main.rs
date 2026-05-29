@@ -2,22 +2,18 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 
-mod document;
-mod editor;
-mod input;
 mod parser;
-mod pager;
-mod position;
-mod primitives;
 mod renderer;
-mod selection;
+#[cfg(feature = "rich")]
+mod rich;
 mod theme;
 mod view;
+mod pager;
 mod watcher;
 
 use theme::{Theme, ThemeType};
 
-/// A beautiful terminal markdown viewer with editorial aesthetics
+/// A beautiful, read-only terminal markdown reader.
 #[derive(Parser, Debug)]
 #[command(name = "mdview")]
 #[command(version, about, long_about = None)]
@@ -29,33 +25,62 @@ struct Args {
     #[arg(short, long)]
     watch: bool,
 
-    /// Print to stdout instead of pager mode
+    /// Print to stdout instead of opening a reader
     #[arg(short, long)]
     print: bool,
 
-    /// Color theme: paper (default), dark, light
-    #[arg(short = 't', long, default_value = "paper")]
-    theme: String,
+    /// Use the classic text reader instead of the graphical (rich) reader
+    #[arg(long)]
+    tui: bool,
+
+    /// Color theme
+    #[arg(short = 't', long, value_enum, default_value = "paper")]
+    theme: ThemeType,
+
+    /// (rich) Export the rendered page to a PNG file instead of displaying.
+    /// Useful for previewing the typography without a graphics terminal.
+    #[cfg(feature = "rich")]
+    #[arg(long, value_name = "PATH")]
+    export_png: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let theme = Theme::new(ThemeType::from_str(&args.theme));
-
-    // Read and parse the markdown file
+    let theme = Theme::new(args.theme);
     let content = std::fs::read_to_string(&args.file)?;
 
-    if args.print {
-        // Simple stdout mode
-        let rendered = renderer::render(&content);
-        println!("{}", rendered);
-    } else if args.watch {
-        // Watch mode with pager
-        watcher::watch_and_display(&args.file, theme)?;
-    } else {
-        // Interactive pager mode (with file path for saving)
-        pager::run(&content, theme, Some(args.file))?;
+    #[cfg(feature = "rich")]
+    if let Some(out) = args.export_png.as_ref() {
+        rich::export_png(&content, out)?;
+        println!("Wrote {}", out.display());
+        return Ok(());
     }
 
-    Ok(())
+    if args.print {
+        print!("{}", renderer::render(&content));
+        return Ok(());
+    }
+
+    if args.watch {
+        return watcher::watch_and_display(&args.file, theme);
+    }
+
+    if args.tui {
+        return pager::run(&content, theme);
+    }
+
+    // Default: the graphical (rich) reader, falling back to the classic text
+    // reader when a graphics-capable terminal isn't available (or when the
+    // rich feature isn't compiled in).
+    #[cfg(feature = "rich")]
+    {
+        match rich::run(&content) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("rich reader unavailable ({e}); falling back to --tui.");
+            }
+        }
+    }
+
+    pager::run(&content, theme)
 }

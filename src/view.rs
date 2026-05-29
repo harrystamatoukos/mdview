@@ -3,10 +3,14 @@
 //! Encapsulates scroll position and animation state, separated from
 //! the main Pager struct for cleaner organization.
 
-// Easing factor: higher = snappier, lower = smoother
-const SCROLL_EASING: f64 = 0.3;
+// Easing factor: higher = snappier, lower = smoother.
+// Terminal scrolling is line-based, so a slow easing value feels like input lag.
+const SCROLL_EASING: f64 = 0.55;
 // Threshold to snap to target (avoid endless micro-animations)
-const SCROLL_SNAP_THRESHOLD: f64 = 0.5;
+const SCROLL_SNAP_THRESHOLD: f64 = 0.25;
+// Keep repeated wheel/trackpad events from pushing the visual position far
+// behind the target. This preserves smoothing without a sluggish tail.
+const MAX_SCROLL_LAG: f64 = 6.0;
 
 /// Viewport and scroll state
 ///
@@ -32,6 +36,7 @@ impl ViewState {
     /// Scroll up by a number of lines
     pub fn scroll_up(&mut self, lines: usize) {
         self.scroll_target = (self.scroll_target - lines as f64).max(0.0);
+        self.limit_lag();
     }
 
     /// Scroll down by a number of lines
@@ -41,16 +46,26 @@ impl ViewState {
     pub fn scroll_down(&mut self, lines: usize, total_lines: usize, viewport_height: usize) {
         let max_scroll = total_lines.saturating_sub(viewport_height) as f64;
         self.scroll_target = (self.scroll_target + lines as f64).min(max_scroll);
+        self.limit_lag();
     }
 
     /// Jump to the top of the document
     pub fn scroll_to_top(&mut self) {
         self.scroll_target = 0.0;
+        self.limit_lag();
     }
 
     /// Jump to the bottom of the document
     pub fn scroll_to_bottom(&mut self, total_lines: usize, viewport_height: usize) {
         self.scroll_target = total_lines.saturating_sub(viewport_height) as f64;
+        self.limit_lag();
+    }
+
+    /// Clamp current and target scroll positions to the available content range.
+    pub fn clamp_to_content(&mut self, total_lines: usize, viewport_height: usize) {
+        let max_scroll = total_lines.saturating_sub(viewport_height) as f64;
+        self.scroll_target = self.scroll_target.clamp(0.0, max_scroll);
+        self.scroll_current = self.scroll_current.clamp(0.0, max_scroll);
     }
 
     /// Scroll to ensure a specific line is visible
@@ -58,7 +73,15 @@ impl ViewState {
     /// `line` is the line number to make visible
     /// `viewport_height` is the visible area height
     /// `margin` is the number of lines to keep above/below the target
+    #[allow(dead_code)] // scroll API exercised by tests
     pub fn ensure_line_visible(&mut self, line: usize, viewport_height: usize, margin: usize) {
+        if viewport_height == 0 {
+            self.scroll_target = line as f64;
+            self.limit_lag();
+            return;
+        }
+
+        let margin = margin.min(viewport_height.saturating_sub(1));
         let scroll_pos = self.position();
 
         // Scroll up if line is above viewport (with margin)
@@ -66,8 +89,19 @@ impl ViewState {
             self.scroll_target = line.saturating_sub(margin) as f64;
         }
         // Scroll down if line is below viewport (with margin)
-        else if line >= scroll_pos + viewport_height - margin {
-            self.scroll_target = (line.saturating_sub(viewport_height - margin - 1)) as f64;
+        else if line >= scroll_pos + viewport_height.saturating_sub(margin) {
+            let bottom_margin = viewport_height.saturating_sub(margin + 1);
+            self.scroll_target = line.saturating_sub(bottom_margin) as f64;
+        }
+        self.limit_lag();
+    }
+
+    fn limit_lag(&mut self) {
+        let diff = self.scroll_target - self.scroll_current;
+        if diff > MAX_SCROLL_LAG {
+            self.scroll_current = self.scroll_target - MAX_SCROLL_LAG;
+        } else if diff < -MAX_SCROLL_LAG {
+            self.scroll_current = self.scroll_target + MAX_SCROLL_LAG;
         }
     }
 
@@ -95,11 +129,13 @@ impl ViewState {
     }
 
     /// Get the target scroll position
+    #[allow(dead_code)] // exercised by tests
     pub fn target(&self) -> f64 {
         self.scroll_target
     }
 
     /// Check if currently animating
+    #[allow(dead_code)] // exercised by tests
     pub fn is_animating(&self) -> bool {
         (self.scroll_target - self.scroll_current).abs() >= SCROLL_SNAP_THRESHOLD
     }
@@ -195,5 +231,26 @@ mod tests {
         view.scroll_target = 50.0;
         view.ensure_line_visible(75, viewport, margin);
         assert!(view.target() > 50.0);
+    }
+
+    #[test]
+    fn test_clamp_to_content() {
+        let mut view = ViewState::new();
+        view.scroll_current = 100.0;
+        view.scroll_target = 100.0;
+
+        view.clamp_to_content(30, 10);
+
+        assert_eq!(view.position(), 20);
+        assert_eq!(view.target(), 20.0);
+    }
+
+    #[test]
+    fn test_ensure_line_visible_zero_viewport() {
+        let mut view = ViewState::new();
+
+        view.ensure_line_visible(5, 0, 3);
+
+        assert_eq!(view.target(), 5.0);
     }
 }
