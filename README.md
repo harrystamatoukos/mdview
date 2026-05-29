@@ -1,72 +1,88 @@
 # mdview
 
-A beautiful terminal markdown viewer with editorial aesthetics. Designed for **reading**, not coding.
+A beautiful, **read-only** terminal markdown reader. Designed for reading, not editing.
 
-> **Learning Project**: This project exists primarily as a hands-on way to learn Rust and terminal programming (TUI with ratatui, raw mode, escape sequences, etc.). It's a real, usable tool — but also a playground for understanding how terminals actually work under the hood.
+mdview renders markdown the way a book treats text — a comfortable measure, generous
+whitespace, and clear typographic hierarchy — and ships two readers:
 
-## Philosophy
+- **Graphical reader (default).** Lays out the page with a real proportional font
+  (via [cosmic-text](https://github.com/pop-os/cosmic-text) — shaping, kerning,
+  anti-aliasing) and displays it inline through a terminal **graphics protocol**
+  (kitty / iTerm2). It reads like a native app, not a grid of monospace cells.
+- **Classic text reader (`--tui`).** Styled terminal text that works in any terminal.
+  Used automatically as a fallback when no graphics-capable terminal is detected.
 
-Most markdown viewers feel like code editors. mdview takes a different approach:
+## Install
 
-- **66-character line width** — The typographer's optimal reading measure (Bringhurst)
-- **Generous whitespace** — Breathing room between sections
-- **Warm, muted colors** — Easy on the eyes, like a well-printed book
-- **Respects your terminal** — Body text uses your chosen colors
-
-## Installation
+### Homebrew (macOS)
 
 ```bash
-# From source
+brew install harrystamatoukos/tap/mdview
+```
+
+### From source
+
+```bash
 git clone https://github.com/harrystamatoukos/mdview
 cd mdview
 cargo build --release
+cp target/release/mdview /usr/local/bin/   # or anywhere on your PATH
+```
 
-# Copy to your path
-cp target/release/mdview ~/.local/bin/
-# or
-sudo cp target/release/mdview /usr/local/bin/
+For a leaner, text-only build without the graphical reader:
+
+```bash
+cargo build --release --no-default-features
 ```
 
 ## Usage
 
 ```bash
-# Interactive pager mode
-mdview document.md
+mdview document.md            # graphical reader (default)
+mdview --tui document.md      # classic text reader
+mdview --print document.md    # render to stdout (for piping)
+mdview --watch document.md    # auto-refresh on file changes (text reader)
+mdview --theme dark document.md   # text reader theme: paper | dark | light
 
-# Watch mode — auto-refresh on file changes
-mdview -w document.md
-
-# Print to stdout (for piping)
-mdview -p document.md
+# Preview the graphical typography as a PNG (no graphics terminal required)
+mdview --export-png out.png document.md
 ```
 
-## Keyboard Shortcuts
+## Keyboard shortcuts
 
 | Key | Action |
 |-----|--------|
-| `j` / `Down` | Scroll down |
-| `k` / `Up` | Scroll up |
-| `d` | Half page down |
-| `u` | Half page up |
-| `g` | Go to top |
-| `G` | Go to bottom |
-| `q` | Quit |
-
-## Features
-
-- Headers, paragraphs, lists (ordered & unordered)
-- Blockquotes with subtle left border
-- Code blocks with syntax highlighting
-- Tables with smart rendering:
-  - Fits? Traditional tabular layout
-  - Too wide? Card layout (each row as vertical block)
-- Horizontal rules
-- Watch mode for live editing
+| `j` / `↓` | Scroll down |
+| `k` / `↑` | Scroll up |
+| `Space` / `PageDown` | Page down |
+| `b` / `PageUp` | Page up |
+| `d` / `u` | Half page down / up *(text reader)* |
+| `g` / `Home` | Go to top |
+| `G` / `End` | Go to bottom |
+| Mouse wheel | Scroll |
+| `q` / `Esc` | Quit |
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
-- A modern terminal with truecolor support (Ghostty, iTerm2, Kitty, etc.)
+- **Graphical reader:** a graphics-capable terminal — **Ghostty, Kitty, iTerm2, or
+  WezTerm**. On any other terminal mdview falls back to the text reader.
+- **Text reader (`--tui`):** any terminal; truecolor recommended.
+- **Building from source:** Rust 1.85+ (edition 2024).
+
+## What it renders
+
+Headings, paragraphs, **bold** / *italic* / `inline code`, links, ordered &
+unordered (nested) lists, blockquotes, fenced code blocks, horizontal rules, and
+tables (tabular when they fit, card layout when too wide).
+
+## Notes
+
+- This started as a hands-on project for learning Rust and terminal programming
+  (ratatui, raw mode, escape sequences, terminal graphics protocols) — and grew
+  into a genuinely pleasant way to read markdown in the terminal.
+- The graphical reader transmits each rendered page band to the terminal **once**
+  (zlib-compressed) and scrolls by repositioning it, so scrolling stays smooth on
+  long documents.
 
 ## License
 
