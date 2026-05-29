@@ -230,7 +230,12 @@ fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool) -> String {
     const ZLIB_LEVEL: u8 = 2;
 
     let (w, h) = (img.width(), img.height());
+    // mdview patch (perf): time the RGBA materialization. `img` is already
+    // ImageRgba8 here, so to_rgba8() re-clones the whole buffer (~32 MB) — a
+    // candidate to eliminate. Logged so its cost is visible.
+    let t_rgba = std::time::Instant::now();
     let img_rgba8 = img.to_rgba8();
+    let rgba_ms = t_rgba.elapsed().as_millis();
     let raw = img_rgba8.as_raw();
 
     // mdview patch: compress the pixel data with zlib (kitty `o=z`). The rich
@@ -240,12 +245,14 @@ fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool) -> String {
     // jank. Text-on-background RGBA is highly compressible (long identical-pixel
     // runs), shrinking the transmit ~20-50x. Falls back to raw if compression
     // doesn't help, or if disabled via the MDVIEW_NO_KITTY_COMPRESS env var.
+    let t_zlib = std::time::Instant::now();
     let compressed: Option<Vec<u8>> = if std::env::var_os("MDVIEW_NO_KITTY_COMPRESS").is_some() {
         None
     } else {
         let c = miniz_oxide::deflate::compress_to_vec_zlib(raw, ZLIB_LEVEL);
         (c.len() < raw.len()).then_some(c)
     };
+    let zlib_ms = t_zlib.elapsed().as_millis();
     let zlib = compressed.is_some();
     let bytes: &[u8] = compressed.as_deref().unwrap_or(raw);
 
@@ -264,6 +271,8 @@ fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool) -> String {
     let reserve_size =
         (chunk_count * bytes_written_per_chunk) + WORST_CASE_ADDITIONAL_CHUNK_0_LEN + end.len();
 
+    // mdview patch (perf): time the base64 encode + control-string build.
+    let t_b64 = std::time::Instant::now();
     let mut data = String::with_capacity(reserve_size);
 
     for (i, chunk) in chunks.enumerate() {
@@ -289,8 +298,35 @@ fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool) -> String {
         write!(data, "{escape}\\").unwrap();
         data.push_str(end);
     }
+    let b64_ms = t_b64.elapsed().as_millis();
+
+    // mdview patch (perf): break the per-band encode into its phases so we can
+    // see which one to push on. Pairs with the "band render" line the reader logs.
+    mdview_perf_log(&format!(
+        "  transmit: to_rgba8 {rgba_ms} + zlib {zlib_ms} + base64/build {b64_ms} ms \
+         (raw {:.1} MB, {chunk_count} chunks, zlib={zlib})",
+        raw.len() as f64 / 1e6,
+    ));
 
     data
+}
+
+/// mdview patch (perf): append a line to the reader's perf log
+/// (`$TMPDIR/mdview-perf.log`) when `MDVIEW_PERF` is set. Self-contained so the
+/// vendored crate needs no dependency on the parent crate; a no-op otherwise.
+fn mdview_perf_log(msg: &str) {
+    if std::env::var_os("MDVIEW_PERF").is_none() {
+        return;
+    }
+    use std::io::Write as _;
+    let path = std::env::temp_dir().join("mdview-perf.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{msg}");
+    }
 }
 
 /// From https://sw.kovidgoyal.net/kitty/_downloads/1792bad15b12979994cd6ecc54c967a6/rowcolumn-diacritics.txt

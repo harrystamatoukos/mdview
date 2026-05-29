@@ -208,14 +208,20 @@ fn render_worker(
     req_rx: Receiver<Request>,
     resp_tx: Sender<Response>,
 ) {
-    let t0 = std::time::Instant::now();
+    let t_parse = std::time::Instant::now();
     let elements = crate::parser::parse(&markdown);
+    let parse_ms = t_parse.elapsed().as_millis();
     let n_elements = elements.len();
+    let t_fs = std::time::Instant::now();
     let mut painter = Painter::new();
+    let fs_ms = t_fs.elapsed().as_millis();
+    let t_begin = std::time::Instant::now();
     let mut doc = painter.begin(elements, &style);
+    let begin_ms = t_begin.elapsed().as_millis();
     perf_log(&format!(
-        "worker init: {} ms (FontSystem + parse, {n_elements} elements, page_w={})",
-        t0.elapsed().as_millis(),
+        "worker init: {} ms [parse {parse_ms} + FontSystem {fs_ms} + begin {begin_ms}] \
+         ({n_elements} elements, page_w={})",
+        parse_ms + fs_ms + begin_ms,
         doc.page_w
     ));
 
@@ -268,6 +274,20 @@ fn render_worker(
             }
         }
 
+        // 3b. One-time: the first band(s) are on screen using the fast core
+        // fonts. Now load the full system database (non-Latin / emoji coverage
+        // for the rest of the document). Done here — after the target and its
+        // neighbors are served, with the worker caught up — so it never delays
+        // first paint or an active scroll. No-op unless we started core-only.
+        if painter.is_core_only() && !produced.is_empty() {
+            painter.ensure_full_fonts();
+            let _ = resp_tx.send(Response::Progress {
+                total_h: doc.total_h,
+                fully_shaped: doc.fully_shaped(),
+            });
+            continue 'main;
+        }
+
         // 4. Nothing urgent → trickle-shape the rest in the background.
         if !doc.fully_shaped() {
             painter.shape_step(&mut doc, SHAPE_CHUNK);
@@ -311,20 +331,27 @@ fn render_band(
     let win_h_doc = ((t.rows as u64 * cell_h) as f64 / scale as f64).round() as u32;
     let win_h_doc = win_h_doc.min(doc.total_h.saturating_sub(y0_doc)).max(1);
 
-    let tload = std::time::Instant::now();
+    let t_raster = std::time::Instant::now();
     let img = painter.render_window_scaled(doc, y0_doc, win_h_doc, scale);
+    let raster_ms = t_raster.elapsed().as_millis();
     let (bw, bh) = (img.width(), img.height());
     let cols = bw.div_ceil(cell_w).max(1) as u16;
     let rows = bh.div_ceil(t.cell_h).max(1);
+    // `encode` is SlicedProtocol::new, which slices the band and runs the
+    // vendored kitty transmit (to_rgba8 + zlib + base64) — broken down further
+    // by the "  transmit:" sub-line that transmit_virtual logs.
+    let t_enc = std::time::Instant::now();
     let proto = SlicedProtocol::new(
         picker,
         DynamicImage::ImageRgba8(img),
         Some(Size::new(cols, rows as u16)),
     )
     .ok()?;
+    let enc_ms = t_enc.elapsed().as_millis();
     perf_log(&format!(
-        "band render: {} ms (s={scale:.3}, row0={row0}, img={bw}x{bh}, cols={cols}, rows={rows})",
-        tload.elapsed().as_millis()
+        "band render: {} ms [raster {raster_ms} + encode {enc_ms}] \
+         (s={scale:.3}, row0={row0}, img={bw}x{bh}, cols={cols}, rows={rows})",
+        raster_ms + enc_ms
     ));
 
     Some(Response::Band {

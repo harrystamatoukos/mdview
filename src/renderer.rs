@@ -248,9 +248,9 @@ fn render_element_styled(
                     lines.push(builder.finish());
                 }
 
-                if let Some(nested) = &item.nested {
+                for block in &item.blocks {
                     let nested_margin = format!("{}{}", margin, " ".repeat(NESTED_LIST_INDENT));
-                    render_element_styled(nested, lines, &nested_margin, width.saturating_sub(NESTED_LIST_INDENT), theme);
+                    render_element_styled(block, lines, &nested_margin, width.saturating_sub(NESTED_LIST_INDENT), theme);
                 }
             }
             lines.push(Line::from(""));
@@ -368,6 +368,9 @@ fn wrap_spans_styled(spans: &[Span], width: usize, theme: &Theme) -> Vec<Vec<Sty
                 (link_text, theme.link())
             }
             SpanKind::Strikethrough(t) => (t.clone(), theme.strikethrough()),
+            SpanKind::FootnoteRef { number, .. } => {
+                (crate::parser::superscript(*number), theme.body())
+            }
             SpanKind::SoftBreak => (" ".to_string(), theme.body()),
             SpanKind::HardBreak => ("\n".to_string(), theme.body()),
         };
@@ -543,6 +546,7 @@ fn render_spans_to_string(spans: &[Span]) -> String {
             SpanKind::Code(t) => format!("‹{}›", t),
             SpanKind::Link { text, url } => format!("{} [→ {}]", text, url),
             SpanKind::Strikethrough(t) => t.clone(),
+            SpanKind::FootnoteRef { number, .. } => crate::parser::superscript(*number),
             SpanKind::SoftBreak => " ".to_string(),
             SpanKind::HardBreak => "\n".to_string(),
         })
@@ -638,8 +642,8 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
                 let text = render_spans_to_string(&item.spans);
                 output.push_str(&format!("{}  {}{}\n", margin, marker, text));
 
-                if let Some(nested) = &item.nested {
-                    output.push_str(&render_element_plain(nested, indent + 3));
+                for block in &item.blocks {
+                    output.push_str(&render_element_plain(block, indent + 3));
                 }
             }
             output.push('\n');

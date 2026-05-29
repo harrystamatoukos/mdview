@@ -4,7 +4,7 @@
 //! were removed with the editor path because read mode never maps screen
 //! positions back to markdown bytes.
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ELEMENT - Parsed markdown block
@@ -36,7 +36,17 @@ pub enum Element {
     Table {
         headers: Vec<String>,
         rows: Vec<Vec<String>>,
+        /// Per-column horizontal alignment (defaults to Left when unspecified).
+        aligns: Vec<CellAlign>,
     }
+}
+
+/// Per-column table alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellAlign {
+    Left,
+    Center,
+    Right,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -45,8 +55,14 @@ pub enum Element {
 
 #[derive(Debug, Clone)]
 pub struct ListItem {
+    /// Leading inline text of the item (rendered on the marker line).
     pub spans: Vec<Span>,
-    pub nested: Option<Box<Element>>,
+    /// Block-level content following the leading text: code blocks, blockquotes,
+    /// nested lists, and additional paragraphs.
+    pub blocks: Vec<Element>,
+    /// GFM task-list state: `None` for a normal item, `Some(true/false)` for a
+    /// checked/unchecked checkbox item.
+    pub task: Option<bool>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -67,6 +83,9 @@ pub enum SpanKind {
     Code(String),
     Link { text: String, url: String },
     Strikethrough(String),
+    /// A footnote reference. `number` is resolved after parsing (order of first
+    /// reference); `label` is the source identifier used to dedupe references.
+    FootnoteRef { label: String, number: usize },
     SoftBreak,
     HardBreak,
 }
@@ -98,15 +117,118 @@ pub fn parse(content: &str) -> Vec<Element> {
     let parser = Parser::new_ext(content, options);
 
     let mut elements = Vec::new();
+    let mut footnote_defs: Vec<(String, Vec<Element>)> = Vec::new();
     let mut event_iter = parser.peekable();
 
     while let Some(event) = event_iter.next() {
+        if let Event::Start(Tag::FootnoteDefinition(label)) = &event {
+            let label = label.to_string();
+            let inner = collect_footnote_def(&mut event_iter);
+            footnote_defs.push((label, inner));
+            continue;
+        }
         if let Some(element) = parse_event(event, &mut event_iter) {
             elements.push(element);
         }
     }
 
+    resolve_footnotes(&mut elements, footnote_defs);
     elements
+}
+
+/// Collect the block content of a footnote definition until its end tag.
+fn collect_footnote_def<'a, I>(iter: &mut std::iter::Peekable<I>) -> Vec<Element>
+where
+    I: Iterator<Item = Event<'a>>,
+{
+    let mut elements = Vec::new();
+    loop {
+        match iter.next() {
+            Some(Event::End(TagEnd::FootnoteDefinition)) => break,
+            Some(e) => {
+                if let Some(el) = parse_event(e, iter) {
+                    elements.push(el);
+                }
+            }
+            None => break,
+        }
+    }
+    elements
+}
+
+/// Number footnote references by order of first reference, then append a
+/// footnotes section (a rule followed by numbered definitions) at the end.
+fn resolve_footnotes(elements: &mut Vec<Element>, defs: Vec<(String, Vec<Element>)>) {
+    use std::collections::HashMap;
+
+    fn number_spans(spans: &mut [Span], map: &mut HashMap<String, usize>, next: &mut usize) {
+        for s in spans {
+            if let SpanKind::FootnoteRef { label, number } = &mut s.kind {
+                let n = *map.entry(label.clone()).or_insert_with(|| {
+                    let v = *next;
+                    *next += 1;
+                    v
+                });
+                *number = n;
+            }
+        }
+    }
+    fn walk(els: &mut [Element], map: &mut HashMap<String, usize>, next: &mut usize) {
+        for el in els {
+            match el {
+                Element::Heading { spans, .. } | Element::Paragraph { spans } => {
+                    number_spans(spans, map, next)
+                }
+                Element::BlockQuote { elements } => walk(elements, map, next),
+                Element::List { items, .. } => {
+                    for it in items {
+                        number_spans(&mut it.spans, map, next);
+                        walk(&mut it.blocks, map, next);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut map: HashMap<String, usize> = HashMap::new();
+    let mut next = 1usize;
+    walk(elements, &mut map, &mut next);
+
+    if defs.is_empty() {
+        return;
+    }
+
+    // Order definitions by their reference number; unreferenced ones trail.
+    let mut numbered: Vec<(usize, Vec<Element>)> = defs
+        .into_iter()
+        .map(|(label, inner)| {
+            let n = *map.entry(label.clone()).or_insert_with(|| {
+                let v = next;
+                next += 1;
+                v
+            });
+            (n, inner)
+        })
+        .collect();
+    numbered.sort_by_key(|(n, _)| *n);
+
+    elements.push(Element::HorizontalRule {});
+    for (n, inner) in numbered {
+        // Prefix the first paragraph with "n. "; keep any further blocks as-is.
+        let mut blocks = inner.into_iter();
+        let first = blocks.next();
+        let mut spans = vec![Span { kind: SpanKind::Text(format!("{n}. ")) }];
+        let mut trailing: Vec<Element> = Vec::new();
+        match first {
+            Some(Element::Paragraph { spans: ps }) => spans.extend(ps),
+            Some(other) => trailing.push(other),
+            None => {}
+        }
+        elements.push(Element::Paragraph { spans });
+        trailing.extend(blocks);
+        elements.extend(trailing);
+    }
 }
 
 fn parse_event<'a, I>(
@@ -162,11 +284,20 @@ where
             })
         }
         Event::Rule => Some(Element::HorizontalRule {}),
-        Event::Start(Tag::Table(_)) => {
+        Event::Start(Tag::Table(alignments)) => {
+            let aligns = alignments
+                .iter()
+                .map(|a| match a {
+                    Alignment::Right => CellAlign::Right,
+                    Alignment::Center => CellAlign::Center,
+                    _ => CellAlign::Left,
+                })
+                .collect();
             let (headers, rows) = collect_table(iter);
             Some(Element::Table {
                 headers,
                 rows,
+                aligns,
             })
         }
         _ => None,
@@ -217,10 +348,20 @@ fn spans_to_text(spans: &[Span]) -> String {
             | SpanKind::Code(t)
             | SpanKind::Strikethrough(t) => text.push_str(t),
             SpanKind::Link { text: link_text, .. } => text.push_str(link_text),
+            SpanKind::FootnoteRef { number, .. } => text.push_str(&superscript(*number)),
             SpanKind::SoftBreak | SpanKind::HardBreak => text.push(' '),
         }
     }
     text
+}
+
+/// Render a number as Unicode superscript digits (e.g. 12 → "¹²").
+pub fn superscript(n: usize) -> String {
+    const S: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    n.to_string()
+        .chars()
+        .map(|c| S[(c as u8 - b'0') as usize])
+        .collect()
 }
 
 /// Collect spans until end tag.
@@ -258,6 +399,11 @@ where
                         text,
                         url: dest_url.into_string(),
                     },
+                });
+            }
+            Some(Event::FootnoteReference(label)) => {
+                spans.push(Span {
+                    kind: SpanKind::FootnoteRef { label: label.into_string(), number: 0 },
                 });
             }
             Some(Event::SoftBreak) => {
@@ -303,18 +449,28 @@ where
         match iter.next() {
             Some(Event::Start(Tag::Item)) => {
                 let mut spans = Vec::new();
-                let mut nested = None;
+                let mut blocks: Vec<Element> = Vec::new();
                 let mut style_flags = 0u8;
+                let mut task = None;
+                // The first paragraph becomes the item's leading text; any
+                // further paragraph/block content is collected into `blocks`.
+                let mut seen_leading = false;
 
                 loop {
                     match iter.next() {
                         Some(Event::End(TagEnd::Item)) => break,
-                        Some(Event::Text(t)) => {
+                        Some(Event::TaskListMarker(checked)) => task = Some(checked),
+                        Some(Event::Text(t)) if blocks.is_empty() => {
                             let text = t.into_string();
                             spans.push(Span { kind: styled_text_kind(text, style_flags) });
                         }
-                        Some(Event::Code(t)) => {
+                        Some(Event::Code(t)) if blocks.is_empty() => {
                             spans.push(Span { kind: SpanKind::Code(t.into_string()) });
+                        }
+                        Some(Event::FootnoteReference(label)) if blocks.is_empty() => {
+                            spans.push(Span {
+                                kind: SpanKind::FootnoteRef { label: label.into_string(), number: 0 },
+                            });
                         }
                         Some(Event::Start(Tag::Emphasis)) => style_flags |= EMPHASIS,
                         Some(Event::End(TagEnd::Emphasis)) => style_flags &= !EMPHASIS,
@@ -324,25 +480,29 @@ where
                         Some(Event::End(TagEnd::Strikethrough)) => style_flags &= !STRIKETHROUGH,
                         Some(Event::Start(Tag::Paragraph)) => {
                             let para_spans = collect_spans_until_end(iter, TagEnd::Paragraph);
-                            spans.extend(para_spans);
+                            if !seen_leading && blocks.is_empty() {
+                                spans.extend(para_spans);
+                                seen_leading = true;
+                            } else {
+                                blocks.push(Element::Paragraph { spans: para_spans });
+                            }
                         }
-                        Some(Event::Start(Tag::List(start))) => {
-                            let sub_items = collect_list_items(iter);
-                            nested = Some(Box::new(Element::List {
-                                ordered: start.is_some(),
-                                start,
-                                items: sub_items,
-                            }));
-                        }
-                        Some(Event::SoftBreak) => {
+                        Some(Event::SoftBreak) if blocks.is_empty() => {
                             spans.push(Span { kind: SpanKind::SoftBreak });
                         }
+                        // Any other block element (code block, blockquote,
+                        // nested list, heading, rule, table) is parsed as a
+                        // proper child block of this item.
+                        Some(e) => {
+                            if let Some(el) = parse_event(e, iter) {
+                                blocks.push(el);
+                            }
+                        }
                         None => break,
-                        _ => {}
                     }
                 }
 
-                items.push(ListItem { spans, nested });
+                items.push(ListItem { spans, blocks, task });
             }
             Some(Event::End(TagEnd::List(_))) => break,
             None => break,
