@@ -1,0 +1,39 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="mdview-${VERSION}-${{ matrix.target }}.tar.gz"
+          tar czf "$NAME" -C "target/${{ matrix.target }}/release" mdview
+          shasum -a 256 "$NAME"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mdview-*.tar.gz
