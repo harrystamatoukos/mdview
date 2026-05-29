@@ -1,13 +1,14 @@
+use clap::ValueEnum;
 use ratatui::style::{Color, Modifier, Style};
 
-/// Book-like reading theme based on typography research:
-/// - Line width: 60-70 characters (Bringhurst recommends 66)
-/// - Warm colors reduce eye strain
-/// - Generous whitespace is the #1 differentiator from code
-/// - High contrast (7:1+) but not harsh (avoid pure black/white)
-/// - Vertical rhythm: consistent spacing multiples
-///
-/// See DESIGN_PRINCIPLES.md for the full design philosophy.
+// Book-like reading theme based on typography research:
+// - Line width: 60-70 characters (Bringhurst recommends 66)
+// - Warm colors reduce eye strain
+// - Generous whitespace is the #1 differentiator from code
+// - High contrast (7:1+) but not harsh (avoid pure black/white)
+// - Vertical rhythm: consistent spacing multiples
+//
+// See DESIGN_PRINCIPLES.md for the full design philosophy.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LAYOUT CONSTANTS
@@ -79,7 +80,7 @@ pub const TABLE_CARD_THRESHOLD: usize = 70;
 /// Maximum width for field labels in card layout
 pub const TABLE_LABEL_MAX_WIDTH: usize = 15;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum ThemeType {
     #[default]
     Paper,  // Warm, book-like (best for reading)
@@ -87,20 +88,78 @@ pub enum ThemeType {
     Light,  // Clean but not harsh
 }
 
-impl ThemeType {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "dark" => ThemeType::Dark,
-            "light" => ThemeType::Light,
-            _ => ThemeType::Paper,
-        }
-    }
-}
-
 pub struct Theme {
-    #[allow(dead_code)] // For future theme switching
     pub theme_type: ThemeType,
 }
+
+/// A complete set of colors for one theme variant.
+///
+/// All `Theme` style methods read from the palette chosen by `theme_type`,
+/// so mdview paints its OWN page (background + foreground) rather than
+/// borrowing the terminal's colors. This is what lets a light "paper" page
+/// render correctly inside a dark terminal, and vice versa.
+#[derive(Debug, Clone, Copy)]
+struct Palette {
+    /// Page background - painted across the whole screen
+    canvas_bg: Color,
+    /// Default body text ("ink")
+    ink: Color,
+    /// Heading colors, darkest/strongest (h1) to quietest (h6)
+    h1: Color,
+    h2: Color,
+    h3: Color,
+    h4: Color,
+    h5: Color,
+    h6: Color,
+    /// Warm accent for bullets, bars, rules
+    accent: Color,
+    /// Inline + block code foreground
+    code: Color,
+    /// Link foreground
+    link: Color,
+    /// Subtle structural chrome (borders, grid lines)
+    chrome: Color,
+    /// Status bar foreground / background band
+    status_fg: Color,
+    status_bg: Color,
+}
+
+/// Warm "paper" page - light cream background, dark warm ink.
+/// Used for both `Paper` and `Light`.
+const LIGHT_PALETTE: Palette = Palette {
+    canvas_bg: Color::Rgb(250, 244, 230), // #FAF4E6 warm linen
+    ink: Color::Rgb(46, 42, 36),          // #2E2A24 warm near-black
+    h1: Color::Rgb(138, 46, 18),          // #8A2E12 deep burnt rust
+    h2: Color::Rgb(168, 69, 30),          // #A8451E rust
+    h3: Color::Rgb(181, 101, 29),         // #B5651D ochre
+    h4: Color::Rgb(156, 107, 63),         // #9C6B3F caramel
+    h5: Color::Rgb(138, 109, 82),         // #8A6D52 muted warm brown
+    h6: Color::Rgb(138, 109, 82),         // same as h5 (dimmed)
+    accent: Color::Rgb(193, 91, 44),      // #C15B2C burnt orange
+    code: Color::Rgb(150, 95, 60),        // #965F3C caramel
+    link: Color::Rgb(46, 110, 100),       // #2E6E64 deep teal
+    chrome: Color::Rgb(168, 156, 138),    // #A89C8A muted warm gray
+    status_fg: Color::Rgb(110, 98, 83),   // #6E6253
+    status_bg: Color::Rgb(237, 228, 208), // #EDE4D0 darker cream band
+};
+
+/// Warm dark page - charcoal background, warm light ink, brighter accents.
+const DARK_PALETTE: Palette = Palette {
+    canvas_bg: Color::Rgb(30, 27, 22),    // #1E1B16 warm charcoal
+    ink: Color::Rgb(230, 220, 200),       // #E6DCC8 warm paper text
+    h1: Color::Rgb(242, 166, 90),         // #F2A65A bright amber
+    h2: Color::Rgb(232, 151, 90),         // #E8975A
+    h3: Color::Rgb(217, 160, 102),        // #D9A066
+    h4: Color::Rgb(201, 168, 126),        // #C9A87E
+    h5: Color::Rgb(182, 168, 143),        // #B6A88F
+    h6: Color::Rgb(182, 168, 143),        // same as h5 (dimmed)
+    accent: Color::Rgb(232, 146, 74),     // #E8924A bright burnt orange
+    code: Color::Rgb(224, 168, 106),      // #E0A86A
+    link: Color::Rgb(131, 165, 152),      // #83A598 gruvbox blue-gray
+    chrome: Color::Rgb(107, 95, 79),      // #6B5F4F
+    status_fg: Color::Rgb(168, 155, 134), // #A89B86
+    status_bg: Color::Rgb(42, 39, 31),    // #2A271F
+};
 
 #[allow(dead_code)] // API surface for future inline styling support
 impl Theme {
@@ -108,113 +167,110 @@ impl Theme {
         Self { theme_type }
     }
 
+    /// The color set for the active theme variant.
+    fn palette(&self) -> Palette {
+        match self.theme_type {
+            ThemeType::Paper | ThemeType::Light => LIGHT_PALETTE,
+            ThemeType::Dark => DARK_PALETTE,
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────
-    // Body text - let terminal handle it for best compatibility
-    // Research: user's chosen terminal colors are usually optimal
+    // Canvas - the page itself. Painted across the whole screen so
+    // mdview reads as a page regardless of the terminal's own colors.
+    // ─────────────────────────────────────────────────────────────
+
+    pub fn canvas(&self) -> Style {
+        let p = self.palette();
+        Style::default().fg(p.ink).bg(p.canvas_bg)
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Body text - explicit ink so it stays readable on the painted page
     // ─────────────────────────────────────────────────────────────
 
     pub fn body(&self) -> Style {
-        Style::default()
+        Style::default().fg(self.palette().ink)
     }
 
     pub fn emphasis(&self) -> Style {
-        Style::default().add_modifier(Modifier::ITALIC)
+        self.body().add_modifier(Modifier::ITALIC)
     }
 
     pub fn strong(&self) -> Style {
-        Style::default().add_modifier(Modifier::BOLD)
+        self.body().add_modifier(Modifier::BOLD)
     }
 
     pub fn strong_emphasis(&self) -> Style {
-        Style::default()
+        self.body()
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::ITALIC)
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Headers - warm accent colors, bold
-    // Research: gold/amber tones are warm and readable
-    // Headers need visual distinction but not jarring contrast
+    // Headers - warm colors with clear hierarchy steps, bold
     // ─────────────────────────────────────────────────────────────
 
     pub fn h1(&self) -> Style {
-        // Deep warm brown - like espresso, editorial elegance
-        Style::default()
-            .fg(Color::Rgb(92, 64, 51))     // #5C4033 - rich warm brown
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.palette().h1).add_modifier(Modifier::BOLD)
     }
 
     pub fn h2(&self) -> Style {
-        // Warm brown - slightly lighter
-        Style::default()
-            .fg(Color::Rgb(107, 83, 68))    // #6B5344 - warm brown
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.palette().h2).add_modifier(Modifier::BOLD)
     }
 
     pub fn h3(&self) -> Style {
-        // Muted warm brown
-        Style::default()
-            .fg(Color::Rgb(122, 99, 85))    // #7A6355 - softer brown
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.palette().h3).add_modifier(Modifier::BOLD)
     }
 
     pub fn h4(&self) -> Style {
-        // Even softer warm brown - still distinct but subtler
-        Style::default()
-            .fg(Color::Rgb(137, 114, 100))  // #897264 - muted warm brown
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.palette().h4).add_modifier(Modifier::BOLD)
     }
 
     pub fn h5(&self) -> Style {
-        // Very subtle warm tone
-        Style::default()
-            .fg(Color::Rgb(152, 129, 115))  // #988173 - light warm brown
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.palette().h5).add_modifier(Modifier::BOLD)
     }
 
     pub fn h6(&self) -> Style {
-        // Barely there but still warm
+        // Same hue as H5 but dimmed - the quietest heading
+        Style::default().fg(self.palette().h6).add_modifier(Modifier::DIM)
+    }
+
+    /// Left accent bar shown before H1 titles
+    pub fn h1_accent(&self) -> Style {
         Style::default()
-            .fg(Color::Rgb(152, 129, 115))  // Same as H5 but dim
-            .add_modifier(Modifier::DIM)
+            .fg(self.accent_color())
+            .add_modifier(Modifier::BOLD)
     }
 
     // ─────────────────────────────────────────────────────────────
     // Blockquotes - editorial feel
-    // Research: indented, italic, subtle color
     // ─────────────────────────────────────────────────────────────
 
     pub fn blockquote(&self) -> Style {
-        Style::default()
-            .add_modifier(Modifier::ITALIC)
+        self.body().add_modifier(Modifier::ITALIC)
     }
 
     pub fn blockquote_border(&self) -> Style {
-        // Unified chrome color for structural elements
+        // Warm accent bar - gives quotes a distinct, tinted edge
         Style::default()
-            .fg(self.chrome_color())
+            .fg(self.accent_color())
+            .add_modifier(Modifier::BOLD)
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Code - subtle distinction, respects terminal colors
-    // Per DESIGN_PRINCIPLES: code should recede, not dominate
+    // Code - a soft, legible warm tint that reads as code
     // ─────────────────────────────────────────────────────────────
 
     pub fn inline_code(&self) -> Style {
-        // Subtle: just dim the text slightly, no background or color change
-        // Reader's focus should be on content, not code styling
-        Style::default()
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(self.palette().code)
     }
 
     pub fn code_block(&self) -> Style {
-        // Use terminal default - code blocks are already visually separated
-        // by indentation and whitespace
-        Style::default()
+        Style::default().fg(self.palette().code)
     }
 
     pub fn code_border(&self) -> Style {
-        // Very subtle - borders should almost disappear
         Style::default()
             .fg(self.chrome_color())
             .add_modifier(Modifier::DIM)
@@ -226,7 +282,7 @@ impl Theme {
 
     pub fn link(&self) -> Style {
         Style::default()
-            .fg(Color::Rgb(131, 165, 152))  // Gruvbox blue-gray
+            .fg(self.palette().link)
             .add_modifier(Modifier::UNDERLINED)
     }
 
@@ -235,25 +291,29 @@ impl Theme {
     // ─────────────────────────────────────────────────────────────
 
     pub fn list_marker(&self) -> Style {
-        // Unified chrome color for structural elements
+        // Warm accent - bullets and numbers carry a touch of color
         Style::default()
-            .fg(self.chrome_color())
+            .fg(self.accent_color())
     }
 
     // ─────────────────────────────────────────────────────────────
     // Chrome - unified color for borders, rules, and decorative elements
-    // Consolidates: code_border, blockquote_border, hr, list_marker
     // ─────────────────────────────────────────────────────────────
 
     /// Base chrome color for all decorative/structural elements
     fn chrome_color(&self) -> Color {
-        Color::Rgb(102, 92, 84)  // #665C54 - warm muted gray
+        self.palette().chrome
+    }
+
+    /// Warm accent for structural punctuation: bullets, bars, rules
+    fn accent_color(&self) -> Color {
+        self.palette().accent
     }
 
     pub fn hr(&self) -> Style {
+        // Warm accent rule - a clear but graceful section break
         Style::default()
-            .fg(self.chrome_color())
-            .add_modifier(Modifier::DIM)  // Even more subtle for rules
+            .fg(self.accent_color())
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -261,27 +321,29 @@ impl Theme {
     // ─────────────────────────────────────────────────────────────
 
     pub fn table_header(&self) -> Style {
-        Style::default()
-            .fg(Color::Rgb(92, 64, 51))     // Match h1 - warm brown
-            .add_modifier(Modifier::BOLD)
+        // Match h1
+        Style::default().fg(self.palette().h1).add_modifier(Modifier::BOLD)
     }
 
     pub fn table_border(&self) -> Style {
-        self.hr()
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // Status bar - minimal, doesn't distract
-    // ─────────────────────────────────────────────────────────────
-
-    pub fn status_bar(&self) -> Style {
+        // Keep grid lines quiet so data stays the focus
         Style::default()
+            .fg(self.chrome_color())
             .add_modifier(Modifier::DIM)
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // Status bar - a quiet warm band, distinct from the page
+    // ─────────────────────────────────────────────────────────────
+
+    pub fn status_bar(&self) -> Style {
+        let p = self.palette();
+        Style::default().fg(p.status_fg).bg(p.status_bg)
+    }
+
     pub fn status_bar_accent(&self) -> Style {
-        Style::default()
-            .fg(Color::Rgb(152, 151, 26))   // Gruvbox green
+        let p = self.palette();
+        Style::default().fg(p.accent).bg(p.status_bg)
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -289,16 +351,16 @@ impl Theme {
     // ─────────────────────────────────────────────────────────────
 
     pub fn cursor(&self) -> Style {
-        // Reversed colors make the cursor position unmistakable
-        // This shows exactly where the next character will appear
+        // Reversed colors make the cursor position unmistakable.
+        // On the painted page this becomes an ink block on paper.
         Style::default()
             .add_modifier(Modifier::REVERSED)
     }
 
     pub fn strikethrough(&self) -> Style {
         Style::default()
+            .fg(self.chrome_color())
             .add_modifier(Modifier::CROSSED_OUT)
-            .add_modifier(Modifier::DIM)
     }
 }
 

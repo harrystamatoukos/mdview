@@ -15,11 +15,8 @@ categories = ["command-line-utilities", "text-processing"]
 pulldown-cmark = "0.12"
 
 # TUI framework
-ratatui = "0.29"
-crossterm = "0.28"
-
-# Syntax highlighting for code blocks
-syntect = "5.2"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # File watching for --watch mode
 notify = "7.0"
@@ -30,5 +27,20 @@ clap = { version = "4.5", features = ["derive"] }
 # Error handling
 anyhow = "1.0"
 
-# Clipboard support
-arboard = "3.4"
+# --- Rich reader mode (--rich): proportional-font page rendering ---
+# Enabled by default; build with --no-default-features for the classic TUI-only binary.
+cosmic-text = { version = "0.19", optional = true }
+# Disable default features to avoid the chafa C-library dependency; we only
+# need the crossterm integration and image codecs.
+ratatui-image = { version = "11.0", optional = true, default-features = false, features = ["crossterm", "image-defaults"] }
+image = { version = "0.25", optional = true }
+
+[features]
+default = ["rich"]
+rich = ["dep:cosmic-text", "dep:ratatui-image", "dep:image"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

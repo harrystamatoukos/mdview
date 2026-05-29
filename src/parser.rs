@@ -1,67 +1,41 @@
-//! Markdown parser with source position tracking
+//! Markdown parser for the read-only renderer.
 //!
-//! This module parses markdown into an AST while preserving byte offsets
-//! for WYSIWYG editing support.
+//! The AST keeps only the data needed for visual rendering. Source byte offsets
+//! were removed with the editor path because read mode never maps screen
+//! positions back to markdown bytes.
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, HeadingLevel, CodeBlockKind};
-use std::ops::Range;
-
-use crate::primitives::SourceSpan;
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ELEMENT - Parsed markdown block with source position
+// ELEMENT - Parsed markdown block
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Parsed markdown element for rendering, with source position
+/// Parsed markdown element for rendering.
 #[derive(Debug, Clone)]
 pub enum Element {
     Heading {
         level: u8,
         spans: Vec<Span>,
         text: String,
-        source: SourceSpan,
     },
     Paragraph {
         spans: Vec<Span>,
-        source: SourceSpan,
     },
     CodeBlock {
-        language: Option<String>,
         code: String,
-        source: SourceSpan,
     },
     BlockQuote {
         elements: Vec<Element>,
-        source: SourceSpan,
     },
     List {
         ordered: bool,
         start: Option<u64>,
         items: Vec<ListItem>,
-        source: SourceSpan,
     },
-    HorizontalRule {
-        source: SourceSpan,
-    },
+    HorizontalRule {},
     Table {
         headers: Vec<String>,
         rows: Vec<Vec<String>>,
-        source: SourceSpan,
-    },
-}
-
-impl Element {
-    /// Get the source span for this element
-    pub fn source(&self) -> SourceSpan {
-        match self {
-            Element::Heading { source, .. } => *source,
-            Element::Paragraph { source, .. } => *source,
-            Element::CodeBlock { source, .. } => *source,
-            Element::BlockQuote { source, .. } => *source,
-            Element::List { source, .. } => *source,
-            Element::HorizontalRule { source } => *source,
-            Element::Table { source, .. } => *source,
-        }
     }
 }
 
@@ -73,21 +47,18 @@ impl Element {
 pub struct ListItem {
     pub spans: Vec<Span>,
     pub nested: Option<Box<Element>>,
-    pub source: SourceSpan,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SPAN - Inline content with source position
+// SPAN - Inline content
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
 pub struct Span {
     pub kind: SpanKind,
-    pub source: SourceSpan,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Variants for future inline styling support
 pub enum SpanKind {
     Text(String),
     Emphasis(String),
@@ -100,26 +71,37 @@ pub enum SpanKind {
     HardBreak,
 }
 
+const EMPHASIS: u8 = 1;
+const STRONG: u8 = 2;
+const STRIKETHROUGH: u8 = 4;
+
+fn styled_text_kind(text: String, style_flags: u8) -> SpanKind {
+    if style_flags & STRIKETHROUGH != 0 {
+        SpanKind::Strikethrough(text)
+    } else {
+        match style_flags & (EMPHASIS | STRONG) {
+            0 => SpanKind::Text(text),
+            EMPHASIS => SpanKind::Emphasis(text),
+            STRONG => SpanKind::Strong(text),
+            _ => SpanKind::StrongEmphasis(text),
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PARSER
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Event with its source range
-type RangedEvent<'a> = (Event<'a>, Range<usize>);
-
-/// Parse markdown content into our intermediate representation WITH source positions
+/// Parse markdown content into the read-only intermediate representation.
 pub fn parse(content: &str) -> Vec<Element> {
     let options = Options::all();
     let parser = Parser::new_ext(content, options);
 
-    // Use into_offset_iter to get byte offsets with each event
-    let offset_iter = parser.into_offset_iter();
-
     let mut elements = Vec::new();
-    let mut event_iter = offset_iter.peekable();
+    let mut event_iter = parser.peekable();
 
-    while let Some((event, range)) = event_iter.next() {
-        if let Some(element) = parse_event(event, range, &mut event_iter) {
+    while let Some(event) = event_iter.next() {
+        if let Some(element) = parse_event(event, &mut event_iter) {
             elements.push(element);
         }
     }
@@ -129,58 +111,37 @@ pub fn parse(content: &str) -> Vec<Element> {
 
 fn parse_event<'a, I>(
     event: Event<'a>,
-    range: Range<usize>,
     iter: &mut std::iter::Peekable<I>,
 ) -> Option<Element>
 where
-    I: Iterator<Item = RangedEvent<'a>>,
+    I: Iterator<Item = Event<'a>>,
 {
     match event {
         Event::Start(Tag::Heading { level, .. }) => {
-            let start = range.start;
-            let (spans, end) = collect_spans_until_end_ranged(iter, TagEnd::Heading(level));
+            let spans = collect_spans_until_end(iter, TagEnd::Heading(level));
             let text = spans_to_text(&spans);
             Some(Element::Heading {
                 level: heading_level_to_u8(level),
                 spans,
                 text,
-                source: SourceSpan::from_usize(start, end),
             })
         }
         Event::Start(Tag::Paragraph) => {
-            let start = range.start;
-            let (spans, end) = collect_spans_until_end_ranged(iter, TagEnd::Paragraph);
-            Some(Element::Paragraph {
-                spans,
-                source: SourceSpan::from_usize(start, end),
-            })
+            let spans = collect_spans_until_end(iter, TagEnd::Paragraph);
+            Some(Element::Paragraph { spans })
         }
-        Event::Start(Tag::CodeBlock(kind)) => {
-            let start = range.start;
-            let language = match kind {
-                CodeBlockKind::Fenced(lang) if !lang.is_empty() => Some(lang.into_string()),
-                _ => None,
-            };
-            let (code, end) = collect_text_until_end_ranged(iter, TagEnd::CodeBlock);
-            Some(Element::CodeBlock {
-                language,
-                code,
-                source: SourceSpan::from_usize(start, end),
-            })
+        Event::Start(Tag::CodeBlock(_)) => {
+            let code = collect_text_until_end(iter, TagEnd::CodeBlock);
+            Some(Element::CodeBlock { code })
         }
         Event::Start(Tag::BlockQuote(_)) => {
-            let start = range.start;
             let mut inner_elements = Vec::new();
-            let mut end = range.end;
 
             loop {
                 match iter.next() {
-                    Some((Event::End(TagEnd::BlockQuote(_)), r)) => {
-                        end = r.end;
-                        break;
-                    }
-                    Some((e, r)) => {
-                        if let Some(el) = parse_event(e, r, iter) {
+                    Some(Event::End(TagEnd::BlockQuote(_))) => break,
+                    Some(e) => {
+                        if let Some(el) = parse_event(e, iter) {
                             inner_elements.push(el);
                         }
                     }
@@ -189,30 +150,23 @@ where
             }
             Some(Element::BlockQuote {
                 elements: inner_elements,
-                source: SourceSpan::from_usize(start, end),
             })
         }
         Event::Start(Tag::List(start_num)) => {
-            let start = range.start;
             let ordered = start_num.is_some();
-            let (items, end) = collect_list_items_ranged(iter);
+            let items = collect_list_items(iter);
             Some(Element::List {
                 ordered,
                 start: start_num,
                 items,
-                source: SourceSpan::from_usize(start, end),
             })
         }
-        Event::Rule => Some(Element::HorizontalRule {
-            source: SourceSpan::from_range(range),
-        }),
+        Event::Rule => Some(Element::HorizontalRule {}),
         Event::Start(Tag::Table(_)) => {
-            let start = range.start;
-            let (headers, rows, end) = collect_table_ranged(iter);
+            let (headers, rows) = collect_table(iter);
             Some(Element::Table {
                 headers,
                 rows,
-                source: SourceSpan::from_usize(start, end),
             })
         }
         _ => None,
@@ -230,19 +184,17 @@ fn heading_level_to_u8(level: HeadingLevel) -> u8 {
     }
 }
 
-/// Collect text until end tag, returning text and end position
-fn collect_text_until_end_ranged<'a, I>(
+/// Collect text until end tag.
+fn collect_text_until_end<'a, I>(
     iter: &mut I,
     end_tag: TagEnd,
-) -> (String, usize)
+) -> String
 where
-    I: Iterator<Item = RangedEvent<'a>>,
+    I: Iterator<Item = Event<'a>>,
 {
     let mut text = String::new();
-    let mut end_pos = 0;
 
-    for (event, range) in iter {
-        end_pos = range.end;
+    for event in iter {
         match event {
             Event::End(ref tag) if *tag == end_tag => break,
             Event::Text(t) | Event::Code(t) => text.push_str(&t),
@@ -251,7 +203,7 @@ where
         }
     }
 
-    (text, end_pos)
+    text
 }
 
 fn spans_to_text(spans: &[Span]) -> String {
@@ -271,90 +223,64 @@ fn spans_to_text(spans: &[Span]) -> String {
     text
 }
 
-/// Collect spans until end tag, returning spans and end position
-fn collect_spans_until_end_ranged<'a, I>(
+/// Collect spans until end tag.
+fn collect_spans_until_end<'a, I>(
     iter: &mut std::iter::Peekable<I>,
     end_tag: TagEnd,
-) -> (Vec<Span>, usize)
+) -> Vec<Span>
 where
-    I: Iterator<Item = RangedEvent<'a>>,
+    I: Iterator<Item = Event<'a>>,
 {
     let mut spans = Vec::new();
-    let mut emphasis_level = 0u8;
-    let mut end_pos = 0;
+    let mut style_flags = 0u8;
 
     loop {
         match iter.next() {
-            Some((Event::End(ref tag), range)) if *tag == end_tag => {
-                end_pos = range.end;
-                break;
-            }
-            Some((Event::Text(t), range)) => {
+            Some(Event::End(ref tag)) if *tag == end_tag => break,
+            Some(Event::Text(t)) => {
                 // Use into_string() to avoid allocation when CowStr is already owned
                 let text = t.into_string();
-                let kind = match emphasis_level {
-                    0 => SpanKind::Text(text),
-                    1 => SpanKind::Emphasis(text),
-                    2 => SpanKind::Strong(text),
-                    _ => SpanKind::StrongEmphasis(text),
-                };
-                spans.push(Span {
-                    kind,
-                    source: SourceSpan::from_range(range),
-                });
+                spans.push(Span { kind: styled_text_kind(text, style_flags) });
             }
-            Some((Event::Code(t), range)) => {
-                spans.push(Span {
-                    kind: SpanKind::Code(t.into_string()),
-                    source: SourceSpan::from_range(range),
-                });
+            Some(Event::Code(t)) => {
+                spans.push(Span { kind: SpanKind::Code(t.into_string()) });
             }
-            Some((Event::Start(Tag::Emphasis), _)) => emphasis_level |= 1,
-            Some((Event::End(TagEnd::Emphasis), _)) => emphasis_level &= !1,
-            Some((Event::Start(Tag::Strong), _)) => emphasis_level |= 2,
-            Some((Event::End(TagEnd::Strong), _)) => emphasis_level &= !2,
-            Some((Event::Start(Tag::Strikethrough), _)) => {}
-            Some((Event::End(TagEnd::Strikethrough), _)) => {}
-            Some((Event::Start(Tag::Link { dest_url, .. }), range)) => {
-                let start = range.start;
-                let (text, end) = collect_link_text_ranged(iter);
+            Some(Event::Start(Tag::Emphasis)) => style_flags |= EMPHASIS,
+            Some(Event::End(TagEnd::Emphasis)) => style_flags &= !EMPHASIS,
+            Some(Event::Start(Tag::Strong)) => style_flags |= STRONG,
+            Some(Event::End(TagEnd::Strong)) => style_flags &= !STRONG,
+            Some(Event::Start(Tag::Strikethrough)) => style_flags |= STRIKETHROUGH,
+            Some(Event::End(TagEnd::Strikethrough)) => style_flags &= !STRIKETHROUGH,
+            Some(Event::Start(Tag::Link { dest_url, .. })) => {
+                let text = collect_link_text(iter);
                 spans.push(Span {
                     kind: SpanKind::Link {
                         text,
                         url: dest_url.into_string(),
                     },
-                    source: SourceSpan::from_usize(start, end),
                 });
             }
-            Some((Event::SoftBreak, range)) => {
-                spans.push(Span {
-                    kind: SpanKind::SoftBreak,
-                    source: SourceSpan::from_range(range),
-                });
+            Some(Event::SoftBreak) => {
+                spans.push(Span { kind: SpanKind::SoftBreak });
             }
-            Some((Event::HardBreak, range)) => {
-                spans.push(Span {
-                    kind: SpanKind::HardBreak,
-                    source: SourceSpan::from_range(range),
-                });
+            Some(Event::HardBreak) => {
+                spans.push(Span { kind: SpanKind::HardBreak });
             }
             None => break,
             _ => {}
         }
     }
 
-    (spans, end_pos)
+    spans
 }
 
-fn collect_link_text_ranged<'a, I>(iter: &mut I) -> (String, usize)
+fn collect_link_text<'a, I>(iter: &mut I) -> String
 where
-    I: Iterator<Item = RangedEvent<'a>>,
+    I: Iterator<Item = Event<'a>>,
 {
     let mut text = String::new();
-    let mut end_pos = 0;
 
-    for (event, range) in iter {
-        end_pos = range.end;
+    for event in iter {
         match event {
             Event::End(TagEnd::Link) => break,
             Event::Text(t) => text.push_str(&t),
@@ -362,135 +288,103 @@ where
         }
     }
 
-    (text, end_pos)
+    text
 }
 
-fn collect_list_items_ranged<'a, I>(
+fn collect_list_items<'a, I>(
     iter: &mut std::iter::Peekable<I>,
-) -> (Vec<ListItem>, usize)
+) -> Vec<ListItem>
 where
-    I: Iterator<Item = RangedEvent<'a>>,
+    I: Iterator<Item = Event<'a>>,
 {
     let mut items = Vec::new();
-    let mut end_pos = 0;
 
     loop {
         match iter.next() {
-            Some((Event::Start(Tag::Item), item_range)) => {
-                let item_start = item_range.start;
+            Some(Event::Start(Tag::Item)) => {
                 let mut spans = Vec::new();
                 let mut nested = None;
-                let mut item_end = item_range.end;
-                let mut emphasis_level = 0u8; // Track bold/italic state
+                let mut style_flags = 0u8;
 
                 loop {
                     match iter.next() {
-                        Some((Event::End(TagEnd::Item), range)) => {
-                            item_end = range.end;
-                            break;
-                        }
-                        Some((Event::Text(t), range)) => {
+                        Some(Event::End(TagEnd::Item)) => break,
+                        Some(Event::Text(t)) => {
                             let text = t.into_string();
-                            let kind = match emphasis_level {
-                                0 => SpanKind::Text(text),
-                                1 => SpanKind::Emphasis(text),
-                                2 => SpanKind::Strong(text),
-                                _ => SpanKind::StrongEmphasis(text),
-                            };
-                            spans.push(Span {
-                                kind,
-                                source: SourceSpan::from_range(range),
-                            });
+                            spans.push(Span { kind: styled_text_kind(text, style_flags) });
                         }
-                        Some((Event::Code(t), range)) => {
-                            spans.push(Span {
-                                kind: SpanKind::Code(t.into_string()),
-                                source: SourceSpan::from_range(range),
-                            });
+                        Some(Event::Code(t)) => {
+                            spans.push(Span { kind: SpanKind::Code(t.into_string()) });
                         }
-                        Some((Event::Start(Tag::Emphasis), _)) => emphasis_level |= 1,
-                        Some((Event::End(TagEnd::Emphasis), _)) => emphasis_level &= !1,
-                        Some((Event::Start(Tag::Strong), _)) => emphasis_level |= 2,
-                        Some((Event::End(TagEnd::Strong), _)) => emphasis_level &= !2,
-                        Some((Event::Start(Tag::Paragraph), _)) => {
-                            let (para_spans, _) = collect_spans_until_end_ranged(iter, TagEnd::Paragraph);
+                        Some(Event::Start(Tag::Emphasis)) => style_flags |= EMPHASIS,
+                        Some(Event::End(TagEnd::Emphasis)) => style_flags &= !EMPHASIS,
+                        Some(Event::Start(Tag::Strong)) => style_flags |= STRONG,
+                        Some(Event::End(TagEnd::Strong)) => style_flags &= !STRONG,
+                        Some(Event::Start(Tag::Strikethrough)) => style_flags |= STRIKETHROUGH,
+                        Some(Event::End(TagEnd::Strikethrough)) => style_flags &= !STRIKETHROUGH,
+                        Some(Event::Start(Tag::Paragraph)) => {
+                            let para_spans = collect_spans_until_end(iter, TagEnd::Paragraph);
                             spans.extend(para_spans);
                         }
-                        Some((Event::Start(Tag::List(start)), range)) => {
-                            let list_start = range.start;
-                            let (sub_items, list_end) = collect_list_items_ranged(iter);
+                        Some(Event::Start(Tag::List(start))) => {
+                            let sub_items = collect_list_items(iter);
                             nested = Some(Box::new(Element::List {
                                 ordered: start.is_some(),
                                 start,
                                 items: sub_items,
-                                source: SourceSpan::from_usize(list_start, list_end),
                             }));
                         }
-                        Some((Event::SoftBreak, range)) => {
-                            spans.push(Span {
-                                kind: SpanKind::SoftBreak,
-                                source: SourceSpan::from_range(range),
-                            });
+                        Some(Event::SoftBreak) => {
+                            spans.push(Span { kind: SpanKind::SoftBreak });
                         }
                         None => break,
                         _ => {}
                     }
                 }
 
-                items.push(ListItem {
-                    spans,
-                    nested,
-                    source: SourceSpan::from_usize(item_start, item_end),
-                });
+                items.push(ListItem { spans, nested });
             }
-            Some((Event::End(TagEnd::List(_)), range)) => {
-                end_pos = range.end;
-                break;
-            }
+            Some(Event::End(TagEnd::List(_))) => break,
             None => break,
             _ => {}
         }
     }
 
-    (items, end_pos)
+    items
 }
 
-fn collect_table_ranged<'a, I>(iter: &mut I) -> (Vec<String>, Vec<Vec<String>>, usize)
+fn collect_table<'a, I>(iter: &mut I) -> (Vec<String>, Vec<Vec<String>>)
 where
-    I: Iterator<Item = RangedEvent<'a>>,
+    I: Iterator<Item = Event<'a>>,
 {
     let mut headers = Vec::new();
     let mut rows = Vec::new();
     let mut current_row = Vec::new();
     let mut current_cell = String::new();
     let mut in_header = false;
-    let mut end_pos = 0;
 
-    for (event, range) in iter {
-        end_pos = range.end;
+    for event in iter {
         match event {
             Event::Start(Tag::TableHead) => in_header = true,
             Event::End(TagEnd::TableHead) => {
                 if !current_cell.is_empty() {
-                    headers.push(current_cell.clone());
-                    current_cell.clear();
+                    headers.push(std::mem::take(&mut current_cell));
                 }
                 in_header = false;
             }
             Event::Start(Tag::TableRow) => current_row.clear(),
             Event::End(TagEnd::TableRow) => {
                 if !in_header && !current_row.is_empty() {
-                    rows.push(current_row.clone());
+                    rows.push(std::mem::take(&mut current_row));
                 }
             }
             Event::Start(Tag::TableCell) => current_cell.clear(),
             Event::End(TagEnd::TableCell) => {
                 if in_header {
-                    headers.push(current_cell.clone());
+                    headers.push(std::mem::take(&mut current_cell));
                 } else {
-                    current_row.push(current_cell.clone());
+                    current_row.push(std::mem::take(&mut current_cell));
                 }
-                current_cell.clear();
             }
             Event::Text(t) => current_cell.push_str(&t),
             Event::End(TagEnd::Table) => break,
@@ -498,7 +392,7 @@ where
         }
     }
 
-    (headers, rows, end_pos)
+    (headers, rows)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -507,10 +401,122 @@ where
 
 impl Element {
     /// Get the text content of a heading (legacy helper)
+    #[allow(dead_code)] // exercised by tests / available API
     pub fn heading_text(&self) -> Option<&str> {
         match self {
             Element::Heading { text, .. } => Some(text),
             _ => None,
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_input() {
+        assert!(parse("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_heading() {
+        let els = parse("# Hello");
+        assert_eq!(els.len(), 1);
+        match &els[0] {
+            Element::Heading { level, text, .. } => {
+                assert_eq!(*level, 1);
+                assert_eq!(text, "Hello");
+            }
+            other => panic!("expected heading, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_heading_levels() {
+        for n in 1u8..=6 {
+            let md = format!("{} H", "#".repeat(n as usize));
+            match &parse(&md)[0] {
+                Element::Heading { level, .. } => assert_eq!(*level, n),
+                other => panic!("expected heading, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_heading_text_helper() {
+        assert_eq!(parse("## Title")[0].heading_text(), Some("Title"));
+        assert_eq!(parse("plain")[0].heading_text(), None);
+    }
+
+    #[test]
+    fn test_parse_paragraph_inline() {
+        match &parse("normal *em* **strong** `code`")[0] {
+            Element::Paragraph { spans, .. } => {
+                assert!(spans.iter().any(|s| matches!(&s.kind, SpanKind::Emphasis(t) if t == "em")));
+                assert!(spans.iter().any(|s| matches!(&s.kind, SpanKind::Strong(t) if t == "strong")));
+                assert!(spans.iter().any(|s| matches!(&s.kind, SpanKind::Code(t) if t == "code")));
+            }
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_link() {
+        match &parse("[text](https://example.com)")[0] {
+            Element::Paragraph { spans, .. } => {
+                assert!(spans.iter().any(|s| matches!(&s.kind,
+                    SpanKind::Link { text, url } if text == "text" && url == "https://example.com")));
+            }
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_code_block() {
+        match &parse("```rust\nfn main() {}\n```")[0] {
+            Element::CodeBlock { code, .. } => {
+                assert!(code.contains("fn main()"));
+            }
+            other => panic!("expected code block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unordered_list() {
+        match &parse("- a\n- b\n- c")[0] {
+            Element::List { ordered, items, .. } => {
+                assert!(!ordered);
+                assert_eq!(items.len(), 3);
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ordered_list() {
+        match &parse("1. one\n2. two")[0] {
+            Element::List { ordered, start, items, .. } => {
+                assert!(ordered);
+                assert_eq!(*start, Some(1));
+                assert_eq!(items.len(), 2);
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_blockquote() {
+        assert!(matches!(&parse("> quoted")[0], Element::BlockQuote { .. }));
+    }
+
+    #[test]
+    fn test_parse_horizontal_rule() {
+        assert!(matches!(&parse("---")[0], Element::HorizontalRule { .. }));
+    }
+
 }

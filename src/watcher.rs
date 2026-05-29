@@ -8,7 +8,8 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
-    text::Text,
+    style::Style,
+    text::{Line, Text},
     widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame, Terminal,
 };
@@ -17,19 +18,23 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::document::Document;
 use crate::renderer;
 use crate::theme::Theme;
+use crate::view::ViewState;
 
-// Easing factor: higher = snappier, lower = smoother
-const SCROLL_EASING: f64 = 0.25;
-// Threshold to snap to target (avoid endless micro-animations)
-const SCROLL_SNAP_THRESHOLD: f64 = 0.5;
+const ACTIVE_POLL_MS: u64 = 16;
+const IDLE_POLL_MS: u64 = 50;
+const MAX_EVENTS_PER_FRAME: usize = 32;
+
+enum WatchEvent {
+    Quit,
+    Changed,
+    Ignored,
+}
 
 struct WatchPager {
     content: Text<'static>,
-    scroll_target: f64,
-    scroll_current: f64,
+    view: ViewState,
     total_lines: usize,
     last_refresh: Instant,
     show_refresh_indicator: bool,
@@ -41,8 +46,7 @@ impl WatchPager {
         let total_lines = content.lines.len();
         Self {
             content,
-            scroll_target: 0.0,
-            scroll_current: 0.0,
+            view: ViewState::new(),
             total_lines,
             last_refresh: Instant::now(),
             show_refresh_indicator: false,
@@ -50,54 +54,45 @@ impl WatchPager {
         }
     }
 
-    fn update_content(&mut self, content: Text<'static>) {
+    fn update_content(&mut self, content: Text<'static>, viewport_height: usize) {
         self.total_lines = content.lines.len();
         self.content = content;
-        // Clamp scroll to valid range
-        let max_scroll = self.total_lines.saturating_sub(1) as f64;
-        self.scroll_target = self.scroll_target.min(max_scroll);
-        self.scroll_current = self.scroll_current.min(max_scroll);
+        self.view.clamp_to_content(self.total_lines, viewport_height);
         self.last_refresh = Instant::now();
         self.show_refresh_indicator = true;
     }
 
     fn scroll_up(&mut self, amount: usize) {
-        self.scroll_target = (self.scroll_target - amount as f64).max(0.0);
+        self.view.scroll_up(amount);
     }
 
     fn scroll_down(&mut self, amount: usize, viewport_height: usize) {
-        let max_scroll = self.total_lines.saturating_sub(viewport_height) as f64;
-        self.scroll_target = (self.scroll_target + amount as f64).min(max_scroll);
+        self.view.scroll_down(amount, self.total_lines, viewport_height);
     }
 
     fn scroll_to_top(&mut self) {
-        self.scroll_target = 0.0;
+        self.view.scroll_to_top();
     }
 
     fn scroll_to_bottom(&mut self, viewport_height: usize) {
-        self.scroll_target = self.total_lines.saturating_sub(viewport_height) as f64;
+        self.view.scroll_to_bottom(self.total_lines, viewport_height);
     }
 
     /// Update animation state, returns true if still animating
     fn update_animation(&mut self) -> bool {
-        let diff = self.scroll_target - self.scroll_current;
-
-        if diff.abs() < SCROLL_SNAP_THRESHOLD {
-            self.scroll_current = self.scroll_target;
-            false
-        } else {
-            self.scroll_current += diff * SCROLL_EASING;
-            true
-        }
+        self.view.update_animation()
     }
 
     fn scroll_position(&self) -> usize {
-        self.scroll_current.round() as usize
+        self.view.position()
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self) -> bool {
         if self.show_refresh_indicator && self.last_refresh.elapsed() > Duration::from_secs(2) {
             self.show_refresh_indicator = false;
+            true
+        } else {
+            false
         }
     }
 }
@@ -112,8 +107,7 @@ pub fn watch_and_display(path: &Path, theme: Theme) -> Result<()> {
 
     let size = terminal.size()?;
     let content = std::fs::read_to_string(path)?;
-    let mut document = Document::new(content);
-    let (text, _) = renderer::render_to_text(&mut document, size.width.saturating_sub(4), &theme);
+    let text = renderer::render_to_text(&content, size.width.saturating_sub(4), &theme);
     let mut pager = WatchPager::new(text, theme);
 
     let (tx, rx) = mpsc::channel();
@@ -142,6 +136,8 @@ fn run_watch_loop(
     file_rx: &mpsc::Receiver<()>,
     path: &Path,
 ) -> Result<()> {
+    let mut dirty = true;
+
     loop {
         let viewport_height = terminal.size()?.height.saturating_sub(2) as usize;
         let width = terminal.size()?.width;
@@ -152,72 +148,128 @@ fn run_watch_loop(
             while file_rx.try_recv().is_ok() {}
 
             if let Ok(content) = std::fs::read_to_string(path) {
-                let mut document = Document::new(content);
-                let (text, _) = renderer::render_to_text(&mut document, width.saturating_sub(4), &pager.theme);
-                pager.update_content(text);
+                let text = renderer::render_to_text(&content, width.saturating_sub(4), &pager.theme);
+                pager.update_content(text, viewport_height);
+                dirty = true;
             }
         }
 
-        pager.tick();
+        dirty |= pager.tick();
 
         // Update animation
         let animating = pager.update_animation();
+        dirty |= animating;
 
-        terminal.draw(|frame| draw_watch(frame, pager, viewport_height, path))?;
+        if dirty {
+            terminal.draw(|frame| draw_watch(frame, pager, viewport_height, path))?;
+            dirty = false;
+        }
 
         // Use shorter poll timeout when animating for smoother animation
         let poll_timeout = if animating {
-            Duration::from_millis(16) // ~60fps
+            Duration::from_millis(ACTIVE_POLL_MS) // ~60fps
         } else {
-            Duration::from_millis(50) // Idle, save CPU
+            Duration::from_millis(IDLE_POLL_MS) // Idle, save CPU
         };
 
         if event::poll(poll_timeout)? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Up | KeyCode::Char('k') => pager.scroll_up(1),
-                        KeyCode::Char('u') => pager.scroll_up(viewport_height / 2),
-                        KeyCode::PageUp | KeyCode::Char('b') => pager.scroll_up(viewport_height),
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            pager.scroll_down(1, viewport_height)
-                        }
-                        KeyCode::Char('d') => pager.scroll_down(viewport_height / 2, viewport_height),
-                        KeyCode::PageDown | KeyCode::Char(' ') => {
-                            pager.scroll_down(viewport_height, viewport_height)
-                        }
-                        KeyCode::Char('g') => pager.scroll_to_top(),
-                        KeyCode::Char('G') => pager.scroll_to_bottom(viewport_height),
-                        KeyCode::Home => pager.scroll_to_top(),
-                        KeyCode::End => pager.scroll_to_bottom(viewport_height),
-                        KeyCode::Char('r') => {
-                            if let Ok(content) = std::fs::read_to_string(path) {
-                                let mut document = Document::new(content);
-                                let (text, _) = renderer::render_to_text(&mut document, width.saturating_sub(4), &pager.theme);
-                                pager.update_content(text);
-                            }
-                        }
-                        _ => {}
-                    }
+            for _ in 0..MAX_EVENTS_PER_FRAME {
+                match handle_watch_event(event::read()?, pager, viewport_height, width, path) {
+                    WatchEvent::Quit => return Ok(()),
+                    WatchEvent::Changed => dirty = true,
+                    WatchEvent::Ignored => {}
                 }
-                Event::Mouse(mouse) => {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => pager.scroll_up(3),
-                        MouseEventKind::ScrollDown => pager.scroll_down(3, viewport_height),
-                        _ => {}
-                    }
+
+                if !event::poll(Duration::ZERO)? {
+                    break;
                 }
-                _ => {}
             }
         }
     }
+}
 
-    Ok(())
+fn handle_watch_event(
+    input_event: Event,
+    pager: &mut WatchPager,
+    viewport_height: usize,
+    width: u16,
+    path: &Path,
+) -> WatchEvent {
+    match input_event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => WatchEvent::Quit,
+            KeyCode::Up | KeyCode::Char('k') => {
+                pager.scroll_up(1);
+                WatchEvent::Changed
+            }
+            KeyCode::Char('u') => {
+                pager.scroll_up(viewport_height / 2);
+                WatchEvent::Changed
+            }
+            KeyCode::PageUp | KeyCode::Char('b') => {
+                pager.scroll_up(viewport_height);
+                WatchEvent::Changed
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                pager.scroll_down(1, viewport_height);
+                WatchEvent::Changed
+            }
+            KeyCode::Char('d') => {
+                pager.scroll_down(viewport_height / 2, viewport_height);
+                WatchEvent::Changed
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                pager.scroll_down(viewport_height, viewport_height);
+                WatchEvent::Changed
+            }
+            KeyCode::Char('g') => {
+                pager.scroll_to_top();
+                WatchEvent::Changed
+            }
+            KeyCode::Char('G') => {
+                pager.scroll_to_bottom(viewport_height);
+                WatchEvent::Changed
+            }
+            KeyCode::Home => {
+                pager.scroll_to_top();
+                WatchEvent::Changed
+            }
+            KeyCode::End => {
+                pager.scroll_to_bottom(viewport_height);
+                WatchEvent::Changed
+            }
+            KeyCode::Char('r') => {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    let text = renderer::render_to_text(&content, width.saturating_sub(4), &pager.theme);
+                    pager.update_content(text, viewport_height);
+                    WatchEvent::Changed
+                } else {
+                    WatchEvent::Ignored
+                }
+            }
+            _ => WatchEvent::Ignored,
+        },
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                pager.scroll_up(3);
+                WatchEvent::Changed
+            }
+            MouseEventKind::ScrollDown => {
+                pager.scroll_down(3, viewport_height);
+                WatchEvent::Changed
+            }
+            _ => WatchEvent::Ignored,
+        },
+        Event::Resize(_, _) => WatchEvent::Changed,
+        _ => WatchEvent::Ignored,
+    }
 }
 
 fn draw_watch(frame: &mut Frame, pager: &WatchPager, viewport_height: usize, path: &Path) {
     let area = frame.area();
+
+    // Paint the page color across the whole screen (see pager::draw).
+    frame.buffer_mut().set_style(area, pager.theme.canvas());
 
     let chunks = Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).split(area);
 
@@ -230,9 +282,10 @@ fn draw_watch(frame: &mut Frame, pager: &WatchPager, viewport_height: usize, pat
 
     let scroll_pos = pager.scroll_position();
 
-    let paragraph = Paragraph::new(pager.content.clone()).scroll((scroll_pos as u16, 0));
-
-    frame.render_widget(paragraph, content_area);
+    let total = pager.content.lines.len();
+    let start = scroll_pos.min(total);
+    let end = (scroll_pos + content_area.height as usize).min(total);
+    render_visible_lines(frame, &pager.content.lines[start..end], content_area, pager.theme.canvas());
 
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(Some("↑"))
@@ -278,4 +331,12 @@ fn draw_watch(frame: &mut Frame, pager: &WatchPager, viewport_height: usize, pat
     let status_bar = Paragraph::new(status).style(status_style);
 
     frame.render_widget(status_bar, status_area);
+}
+
+fn render_visible_lines(frame: &mut Frame, lines: &[Line<'static>], area: Rect, style: Style) {
+    let buf = frame.buffer_mut();
+    buf.set_style(area, style);
+    for (row, line) in lines.iter().take(area.height as usize).enumerate() {
+        buf.set_line(area.x, area.y + row as u16, line, area.width);
+    }
 }
