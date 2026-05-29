@@ -19,3 +19,6 @@
 
 # Example/test files (local only)
 examples/
+
+# Local release runbook (not part of the published repo)
+RELEASE.md
