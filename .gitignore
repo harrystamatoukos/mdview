@@ -22,3 +22,6 @@ examples/
 
 # Local release runbook (not part of the published repo)
 RELEASE.md
+
+# Local design research notes (not part of the published repo)
+DESIGN_RESEARCH.md
