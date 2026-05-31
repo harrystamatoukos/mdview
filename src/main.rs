@@ -51,7 +51,8 @@ fn main() -> Result<()> {
 
     #[cfg(feature = "rich")]
     if let Some(out) = args.export_png.as_ref() {
-        rich::export_png(&content, out)?;
+        let base_dir = args.file.parent().map(|p| p.to_path_buf());
+        rich::export_png(&content, out, base_dir)?;
         println!("Wrote {}", out.display());
         return Ok(());
     }
@@ -74,7 +75,8 @@ fn main() -> Result<()> {
     // rich feature isn't compiled in).
     #[cfg(feature = "rich")]
     {
-        match rich::run(&content) {
+        let base_dir = args.file.parent().map(|p| p.to_path_buf());
+        match rich::run(&content, base_dir) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 eprintln!("rich reader unavailable ({e}); falling back to --tui.");

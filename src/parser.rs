@@ -82,6 +82,7 @@ pub enum SpanKind {
     StrongEmphasis(String),
     Code(String),
     Link { text: String, url: String },
+    Image { url: String, alt: String },
     Strikethrough(String),
     /// A footnote reference. `number` is resolved after parsing (order of first
     /// reference); `label` is the source identifier used to dedupe references.
@@ -93,6 +94,29 @@ pub enum SpanKind {
 const EMPHASIS: u8 = 1;
 const STRONG: u8 = 2;
 const STRIKETHROUGH: u8 = 4;
+
+/// Map a raw inline-HTML tag (e.g. `<strong>`, `</em>`) to a style flag and
+/// whether it opens (`true`) or closes (`false`) that style. Returns `None` for
+/// tags we don't translate.
+fn html_style_toggle(tag: &str) -> Option<(u8, bool)> {
+    let t = tag.trim().strip_prefix('<')?.strip_suffix('>')?;
+    let (close, body) = match t.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, t),
+    };
+    let name = body
+        .split(|c: char| c.is_whitespace() || c == '/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let flag = match name.as_str() {
+        "strong" | "b" => STRONG,
+        "em" | "i" => EMPHASIS,
+        "del" | "s" | "strike" => STRIKETHROUGH,
+        _ => return None,
+    };
+    Some((flag, !close))
+}
 
 fn styled_text_kind(text: String, style_flags: u8) -> SpanKind {
     if style_flags & STRIKETHROUGH != 0 {
@@ -348,6 +372,7 @@ fn spans_to_text(spans: &[Span]) -> String {
             | SpanKind::Code(t)
             | SpanKind::Strikethrough(t) => text.push_str(t),
             SpanKind::Link { text: link_text, .. } => text.push_str(link_text),
+            SpanKind::Image { alt, .. } => text.push_str(alt),
             SpanKind::FootnoteRef { number, .. } => text.push_str(&superscript(*number)),
             SpanKind::SoftBreak | SpanKind::HardBreak => text.push(' '),
         }
@@ -406,6 +431,17 @@ where
                     kind: SpanKind::FootnoteRef { label: label.into_string(), number: 0 },
                 });
             }
+            Some(Event::Start(Tag::Image { dest_url, .. })) => {
+                let alt = collect_image_alt(iter);
+                spans.push(Span {
+                    kind: SpanKind::Image { url: dest_url.into_string(), alt },
+                });
+            }
+            Some(Event::InlineHtml(t)) => {
+                if let Some((flag, open)) = html_style_toggle(&t) {
+                    if open { style_flags |= flag } else { style_flags &= !flag }
+                }
+            }
             Some(Event::SoftBreak) => {
                 spans.push(Span { kind: SpanKind::SoftBreak });
             }
@@ -434,6 +470,22 @@ where
         }
     }
 
+    text
+}
+
+/// Collect an image's alt text (the events between Image start and end).
+fn collect_image_alt<'a, I>(iter: &mut I) -> String
+where
+    I: Iterator<Item = Event<'a>>,
+{
+    let mut text = String::new();
+    for event in iter {
+        match event {
+            Event::End(TagEnd::Image) => break,
+            Event::Text(t) | Event::Code(t) => text.push_str(&t),
+            _ => {}
+        }
+    }
     text
 }
 
@@ -471,6 +523,17 @@ where
                             spans.push(Span {
                                 kind: SpanKind::FootnoteRef { label: label.into_string(), number: 0 },
                             });
+                        }
+                        Some(Event::Start(Tag::Image { dest_url, .. })) if blocks.is_empty() => {
+                            let alt = collect_image_alt(iter);
+                            spans.push(Span {
+                                kind: SpanKind::Image { url: dest_url.into_string(), alt },
+                            });
+                        }
+                        Some(Event::InlineHtml(t)) if blocks.is_empty() => {
+                            if let Some((flag, open)) = html_style_toggle(&t) {
+                                if open { style_flags |= flag } else { style_flags &= !flag }
+                            }
                         }
                         Some(Event::Start(Tag::Emphasis)) => style_flags |= EMPHASIS,
                         Some(Event::End(TagEnd::Emphasis)) => style_flags &= !EMPHASIS,

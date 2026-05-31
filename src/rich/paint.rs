@@ -12,7 +12,7 @@
 //! * Generous page margins / whitespace
 
 use cosmic_text::{
-    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style as FontStyle,
+    Align, Attrs, Buffer, Color, Cursor, Family, FontSystem, Metrics, Shaping, Style as FontStyle,
     SwashCache, Weight,
 };
 use image::{imageops, imageops::FilterType, Rgba, RgbaImage};
@@ -173,6 +173,8 @@ fn flatten_spans(spans: &[Span], st: &DocStyle, base_color: Rgb) -> Vec<(String,
             SpanKind::Link { text, .. } => {
                 out.push((text.clone(), Run { color: st.link, ..body }))
             }
+            // Images are lifted out and rendered as their own blocks; ignore here.
+            SpanKind::Image { .. } => {}
             SpanKind::Strikethrough(t) => out.push((t.clone(), Run { color: st.chrome, ..body })),
             SpanKind::FootnoteRef { number, .. } => out.push((
                 crate::parser::superscript(*number),
@@ -221,6 +223,9 @@ pub struct Painter {
     /// True while only the core fonts (Georgia/Menlo) are loaded and the full
     /// system database is still pending (lazy-loaded after first paint).
     core_only: bool,
+    /// Directory of the source markdown file, used to resolve relative image
+    /// paths. `None` disables local image decoding (placeholders only).
+    base_dir: Option<std::path::PathBuf>,
 }
 
 /// Build a [`FontSystem`] containing only the reader's core fonts — Georgia
@@ -321,11 +326,122 @@ pub struct RichDoc {
     fully_shaped: bool,
 }
 
+/// The result of resolving a selection against the laid-out document: the
+/// highlight rectangles to paint and the rendered text to copy. All rectangle
+/// coordinates are in page **device pixels** (the same space the blocks are
+/// laid out in), `(x, y, w, h)`.
+pub struct SelectionRender {
+    pub rects: Vec<(f32, f32, f32, f32)>,
+    pub text: String,
+}
+
 impl RichDoc {
     /// Whether every element has been shaped (so `total_h` is exact).
     pub fn fully_shaped(&self) -> bool {
         self.fully_shaped
     }
+
+    /// Resolve a selection between two page-pixel points (`anchor`, `head`) into
+    /// highlight rectangles + the rendered text between them. Points are in page
+    /// device pixels. Returns `None` if either endpoint doesn't land on shaped
+    /// text. The two points may be given in any order.
+    pub fn select(&self, anchor: (f32, f32), head: (f32, f32)) -> Option<SelectionRender> {
+        let a = self.resolve(anchor)?;
+        let b = self.resolve(head)?;
+        // Order by (block, line, index) so start <= end.
+        let (start, end) = if (a.0, a.1.line, a.1.index) <= (b.0, b.1.line, b.1.index) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+
+        let mut rects = Vec::new();
+        let mut text = String::new();
+        for bi in start.0..=end.0 {
+            let block = &self.blocks[bi];
+            let ox = (self.margin_px + block.indent) as f32;
+            let last = block_end_cursor(&block.buffer);
+            let cs = if bi == start.0 { start.1 } else { Cursor::new(0, 0) };
+            let ce = if bi == end.0 { end.1 } else { last };
+
+            for run in block.buffer.layout_runs() {
+                for (hx, hw) in run.highlight(cs, ce) {
+                    if hw > 0.0 {
+                        rects.push((ox + hx, block.y_top as f32 + run.line_top, hw, run.line_height));
+                    }
+                }
+            }
+
+            if bi != start.0 {
+                text.push('\n');
+            }
+            text.push_str(&block_text(&block.buffer, cs, ce));
+        }
+
+        Some(SelectionRender { rects, text })
+    }
+
+    /// Map a page-pixel point to the block it falls in and the text cursor
+    /// there. Clamps vertically to the nearest block so a point in inter-block
+    /// whitespace still resolves.
+    fn resolve(&self, (x, y): (f32, f32)) -> Option<(usize, Cursor)> {
+        if self.blocks.is_empty() {
+            return None;
+        }
+        let bi = self
+            .blocks
+            .iter()
+            .position(|b| y >= b.y_top as f32 && y < (b.y_top + b.height) as f32)
+            .or_else(|| {
+                // Below all shaped blocks → last; above the first → first.
+                self.blocks
+                    .iter()
+                    .rposition(|b| (b.y_top as f32) <= y)
+                    .or(Some(0))
+            })?;
+        let block = &self.blocks[bi];
+        let ox = (self.margin_px + block.indent) as f32;
+        let local_x = x - ox;
+        let local_y = (y - block.y_top as f32).clamp(0.0, block.height.saturating_sub(1) as f32);
+        let cursor = block.buffer.hit(local_x.max(0.0), local_y)?;
+        Some((bi, cursor))
+    }
+}
+
+/// A cursor at the very end of a buffer's text (last line, past last byte).
+fn block_end_cursor(buffer: &Buffer) -> Cursor {
+    let line = buffer.lines.len().saturating_sub(1);
+    let index = buffer.lines.last().map(|l| l.text().len()).unwrap_or(0);
+    Cursor::new(line, index)
+}
+
+/// Extract the text of one buffer between two cursors (`cs <= ce`), joining
+/// logical lines with `\n`. Byte indices come from `Buffer::hit`, so they are
+/// valid char boundaries; `get` guards against any out-of-range surprise.
+fn block_text(buffer: &Buffer, cs: Cursor, ce: Cursor) -> String {
+    let lines = &buffer.lines;
+    if cs.line == ce.line {
+        return lines
+            .get(cs.line)
+            .and_then(|l| l.text().get(cs.index..ce.index))
+            .unwrap_or("")
+            .to_string();
+    }
+    let mut s = String::new();
+    if let Some(l) = lines.get(cs.line) {
+        s.push_str(l.text().get(cs.index..).unwrap_or(""));
+    }
+    for i in (cs.line + 1)..ce.line {
+        s.push('\n');
+        if let Some(l) = lines.get(i) {
+            s.push_str(l.text());
+        }
+    }
+    s.push('\n');
+    if let Some(l) = lines.get(ce.line) {
+        s.push_str(l.text().get(..ce.index).unwrap_or(""));
+    }
+    s
 }
 
 impl Painter {
@@ -340,13 +456,20 @@ impl Painter {
                 font_system,
                 swash: SwashCache::new(),
                 core_only: true,
+                base_dir: None,
             },
             None => Self {
                 font_system: FontSystem::new(),
                 swash: SwashCache::new(),
                 core_only: false,
+                base_dir: None,
             },
         }
+    }
+
+    /// Set the directory used to resolve relative image paths.
+    pub fn set_base_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.base_dir = dir;
     }
 
     /// Whether only the core fonts are loaded (full system DB still pending).
@@ -711,18 +834,66 @@ impl Painter {
                 }
 
                 Element::Paragraph { spans, .. } => {
-                    let runs = flatten_spans(spans, st, st.ink);
                     let lh = st.base_px * 1.55;
-                    let (buffer, height) =
-                        self.shape(&runs, st, Metrics::new(st.base_px, lh), width, Align::Left);
-                    out.push(Block {
-                        buffer,
-                        line_height: lh,
-                        height,
-                        indent: base_indent,
-                        space_before: st.para_space(),
-                        decorations: Vec::new(),
-                    });
+                    let has_image = spans.iter().any(|s| matches!(s.kind, SpanKind::Image { .. }));
+                    if !has_image {
+                        let runs = flatten_spans(spans, st, st.ink);
+                        let (buffer, height) =
+                            self.shape(&runs, st, Metrics::new(st.base_px, lh), width, Align::Left);
+                        out.push(Block {
+                            buffer,
+                            line_height: lh,
+                            height,
+                            indent: base_indent,
+                            space_before: st.para_space(),
+                            decorations: Vec::new(),
+                        });
+                    } else {
+                        // Lift images out as their own blocks; shape the text
+                        // segments around them as separate paragraphs.
+                        let mut seg: Vec<Span> = Vec::new();
+                        let flush_seg = |me: &mut Self, seg: &mut Vec<Span>, out: &mut Vec<Block>| {
+                            if seg.is_empty() {
+                                return;
+                            }
+                            let runs = flatten_spans(seg, st, st.ink);
+                            let (buffer, height) =
+                                me.shape(&runs, st, Metrics::new(st.base_px, lh), width, Align::Left);
+                            out.push(Block {
+                                buffer,
+                                line_height: lh,
+                                height,
+                                indent: base_indent,
+                                space_before: st.para_space(),
+                                decorations: Vec::new(),
+                            });
+                            seg.clear();
+                        };
+                        for span in spans {
+                            if let SpanKind::Image { url, alt } = &span.kind {
+                                flush_seg(self, &mut seg, out);
+                                let (img, height) = self.image_block(url, alt, st, width);
+                                let (buffer, _) = self.shape(
+                                    &[(String::new(), Run { bold: false, italic: false, mono: false, pill: false, color: st.ink })],
+                                    st,
+                                    Metrics::new(st.base_px, st.base_px),
+                                    width,
+                                    Align::Left,
+                                );
+                                out.push(Block {
+                                    buffer,
+                                    line_height: st.base_px,
+                                    height,
+                                    indent: base_indent,
+                                    space_before: st.para_space(),
+                                    decorations: vec![Decoration::Image { x: 0, y: 0, img }],
+                                });
+                            } else {
+                                seg.push(span.clone());
+                            }
+                        }
+                        flush_seg(self, &mut seg, out);
+                    }
                 }
 
                 Element::List { ordered, start, items, .. } => {
@@ -1104,6 +1275,73 @@ impl Painter {
 
         Some((img, total_h))
     }
+
+    /// Decode a local image file referenced by `url`, resolving relative paths
+    /// against the configured base directory. Returns `None` for remote URLs,
+    /// missing files, or decode failures.
+    fn load_local_image(&self, url: &str) -> Option<RgbaImage> {
+        if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
+            return None;
+        }
+        let raw = url.strip_prefix("file://").unwrap_or(url);
+        let p = std::path::Path::new(raw);
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.base_dir.as_ref()?.join(p)
+        };
+        image::open(&path).ok().map(|i| i.to_rgba8())
+    }
+
+    /// Render an image reference into a bitmap: the decoded image scaled to the
+    /// measure when it's a readable local file, otherwise a framed placeholder
+    /// captioned with the alt text.
+    fn image_block(&mut self, url: &str, alt: &str, st: &DocStyle, width: u32) -> (RgbaImage, u32) {
+        if let Some(decoded) = self.load_local_image(url) {
+            let (iw, ih) = decoded.dimensions();
+            if iw > 0 && ih > 0 {
+                // Fit to the measure; never upscale beyond natural size.
+                let scale = if iw > width { width as f32 / iw as f32 } else { 1.0 };
+                let tw = ((iw as f32 * scale).round() as u32).max(1);
+                let th = ((ih as f32 * scale).round() as u32).max(1);
+                let scaled = if (scale - 1.0).abs() < f32::EPSILON {
+                    decoded
+                } else {
+                    imageops::resize(&decoded, tw, th, FilterType::Triangle)
+                };
+                return (scaled, th);
+            }
+        }
+        self.image_placeholder(alt, st, width)
+    }
+
+    /// A framed, tinted placeholder box captioned with the alt text — shown for
+    /// remote or unreadable images.
+    fn image_placeholder(&mut self, alt: &str, st: &DocStyle, width: u32) -> (RgbaImage, u32) {
+        let pad = (st.base_px * 0.8) as u32;
+        let caption = if alt.trim().is_empty() { "image" } else { alt };
+        let cap_run = Run { bold: false, italic: true, mono: false, pill: false, color: st.code };
+        let (mut cbuf, ch) = self.shape(
+            &[(caption.to_string(), cap_run)],
+            st,
+            Metrics::new(st.base_px * 0.95, st.base_px * 1.3),
+            width.saturating_sub(pad * 2).max(1),
+            Align::Center,
+        );
+        let h = ch + pad * 2;
+        let mut img =
+            RgbaImage::from_pixel(width, h, Rgba([st.code_bg.0, st.code_bg.1, st.code_bg.2, 255]));
+        // Border.
+        let b = (st.base_px * 0.05).max(2.0) as u32;
+        fill_rect(&mut img, 0, 0, width, b, st.chrome);
+        fill_rect(&mut img, 0, (h - b) as i32, width, b, st.chrome);
+        fill_rect(&mut img, 0, 0, b, h, st.chrome);
+        fill_rect(&mut img, (width - b) as i32, 0, b, h, st.chrome);
+        // Caption, vertically centered.
+        let ink = Color::rgb(st.code.0, st.code.1, st.code.2);
+        self.blit_buffer(&mut img, &mut cbuf, pad as i32, ((h - ch) / 2) as i32, ink);
+        (img, h)
+    }
 }
 
 impl Default for Painter {
@@ -1227,7 +1465,7 @@ mod tests {
     fn render_band(px_budget: u32) -> (u32, u32, Vec<u8>) {
         let md = sample_markdown(40);
         let style = DocStyle::light();
-        let (mut painter, mut doc) = crate::rich::lay_out_document(&md, &style);
+        let (mut painter, mut doc) = crate::rich::lay_out_document(&md, &style, None);
         let page_w = doc.page_w;
         let win_h = (px_budget / page_w).max(1);
         let img = painter.render_window(&mut doc, 0, win_h);

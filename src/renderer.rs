@@ -363,6 +363,7 @@ fn wrap_spans_styled(spans: &[Span], width: usize, theme: &Theme) -> Vec<Vec<Sty
             SpanKind::Strong(t) => (t.clone(), theme.strong()),
             SpanKind::StrongEmphasis(t) => (t.clone(), theme.strong_emphasis()),
             SpanKind::Code(t) => (t.clone(), theme.inline_code()),
+            SpanKind::Image { alt, .. } => (format!("[image: {}]", alt), theme.emphasis()),
             SpanKind::Link { text, url } => {
                 let link_text = format!("{} [→ {}]", text, url);
                 (link_text, theme.link())
@@ -544,6 +545,7 @@ fn render_spans_to_string(spans: &[Span]) -> String {
             SpanKind::Strong(t) => t.clone(),
             SpanKind::StrongEmphasis(t) => t.clone(),
             SpanKind::Code(t) => format!("‹{}›", t),
+            SpanKind::Image { alt, url } => format!("[image: {} ({})]", alt, url),
             SpanKind::Link { text, url } => format!("{} [→ {}]", text, url),
             SpanKind::Strikethrough(t) => t.clone(),
             SpanKind::FootnoteRef { number, .. } => crate::parser::superscript(*number),

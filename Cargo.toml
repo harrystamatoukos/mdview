@@ -1,6 +1,6 @@
 [package]
 name = "mdview"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 authors = ["Harry Stamatoukos"]
 description = "A beautiful terminal markdown viewer with editorial aesthetics"
@@ -39,6 +39,9 @@ cosmic-text = { version = "0.19", optional = true }
 # the dominant scroll-jank source. Everything else is byte-for-byte upstream.
 ratatui-image = { path = "vendor/ratatui-image", optional = true, default-features = false, features = ["crossterm", "image-defaults"] }
 image = { version = "0.25", optional = true }
+# Zlib for the kitty `o=z` transmit of the selection-highlight overlay (same
+# compressor the vendored ratatui-image patch uses for bands).
+miniz_oxide = { version = "0.8", optional = true }
 
 [dev-dependencies]
 # Used by an offline test that verifies a representative rendered band's RGBA
@@ -48,7 +51,7 @@ miniz_oxide = "0.8"
 
 [features]
 default = ["rich"]
-rich = ["dep:cosmic-text", "dep:ratatui-image", "dep:image"]
+rich = ["dep:cosmic-text", "dep:ratatui-image", "dep:image", "dep:miniz_oxide"]
 
 [profile.release]
 opt-level = 3

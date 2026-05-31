@@ -141,7 +141,13 @@ Below the rule.
 
 ## Images
 
-![Alt text for an image](https://example.com/image.png)
+Local image (decoded inline):
+
+![A local sample image](sample-image.png)
+
+Remote image (framed placeholder):
+
+![Alt text for a remote image](https://example.com/image.png)
 
 Inline image in text: here is an ![icon](https://example.com/icon.png) mid-sentence.
 

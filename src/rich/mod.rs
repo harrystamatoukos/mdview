@@ -6,11 +6,13 @@
 //!
 //! Gated behind the `rich` cargo feature so the default build stays lean.
 
+mod clipboard;
+mod overlay;
 mod paint;
 mod view;
 
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use paint::{DocStyle, Painter, RichDoc};
 pub use view::run;
@@ -18,9 +20,14 @@ pub use view::run;
 /// Lay out the document once (shaping + positioning, no rasterization).
 /// The painter is returned alongside so the caller can rasterize windows
 /// on demand while scrolling.
-pub fn lay_out_document(markdown: &str, style: &DocStyle) -> (Painter, RichDoc) {
+pub fn lay_out_document(
+    markdown: &str,
+    style: &DocStyle,
+    base_dir: Option<PathBuf>,
+) -> (Painter, RichDoc) {
     let elements = crate::parser::parse(markdown);
     let mut painter = Painter::new();
+    painter.set_base_dir(base_dir);
     let doc = painter.layout(&elements, style);
     (painter, doc)
 }
@@ -29,9 +36,9 @@ pub fn lay_out_document(markdown: &str, style: &DocStyle) -> (Painter, RichDoc) 
 ///
 /// Rasterizes the full document in one shot (only used by `--export-png`, which
 /// is fine for previews; the interactive reader renders bounded windows).
-pub fn export_png(markdown: &str, out: &Path) -> Result<()> {
+pub fn export_png(markdown: &str, out: &Path, base_dir: Option<PathBuf>) -> Result<()> {
     let style = DocStyle::light();
-    let (mut painter, mut doc) = lay_out_document(markdown, &style);
+    let (mut painter, mut doc) = lay_out_document(markdown, &style, base_dir);
     // Whole document into one image, downscaled to a bounded pixel budget and
     // rendered in tiles so even very long documents don't exhaust memory.
     let (img, _scale) = painter.render_scaled(&mut doc, 8_000_000);

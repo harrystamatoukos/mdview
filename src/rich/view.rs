@@ -27,7 +27,8 @@ use std::time::Duration;
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -46,6 +47,11 @@ use ratatui_image::{
 };
 
 use super::{DocStyle, Painter, RichDoc};
+
+/// A point in page device pixels.
+type PxPoint = (f32, f32);
+/// A coalesced selection request: `(request id, anchor, head)`.
+type PendingSelect = (u64, PxPoint, PxPoint);
 
 const EVENT_POLL_MS: u64 = 100;
 /// Faster poll while waiting for the worker to deliver the band under the
@@ -102,7 +108,7 @@ fn perf_log(msg: &str) {
 }
 
 /// Launch the rich reader for the given markdown source.
-pub fn run(markdown: &str) -> Result<()> {
+pub fn run(markdown: &str, base_dir: Option<std::path::PathBuf>) -> Result<()> {
     if perf_enabled() {
         let _ = std::fs::write(perf_path(), b"=== mdview perf ===\n");
         eprintln!("[mdview] perf logging to {}", perf_path().display());
@@ -124,7 +130,7 @@ pub fn run(markdown: &str) -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &picker, markdown);
+    let result = run_loop(&mut terminal, &picker, markdown, base_dir);
 
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
@@ -157,6 +163,13 @@ struct Target {
 
 enum Request {
     SetTarget(Target),
+    /// Resolve a selection between two page-pixel points. `id` lets the UI drop
+    /// stale results from an in-flight drag.
+    Select {
+        id: u64,
+        anchor: (f32, f32),
+        head: (f32, f32),
+    },
     Quit,
 }
 
@@ -174,6 +187,13 @@ enum Response {
     /// Background-shaping progress: the document's height estimate grew (or
     /// became exact). Lets the UI refine its scroll bounds.
     Progress { total_h: u32, fully_shaped: bool },
+    /// Resolved selection: highlight rects (page device px) + text to copy.
+    /// `id` echoes the request so the UI can ignore stale drag results.
+    Selection {
+        id: u64,
+        rects: Vec<(f32, f32, f32, f32)>,
+        text: String,
+    },
 }
 
 /// A decoded band held by the UI. Scrolling within `[row0, row0 + rows)` only
@@ -194,6 +214,61 @@ impl CachedBand {
     }
 }
 
+/// UI-side selection state for mouse drag-to-copy. Endpoints and rects live in
+/// page **device pixels** (resolved by the worker); the UI converts screen
+/// cells to that space on press/drag and converts rects back for the overlay.
+#[derive(Default)]
+struct Selection {
+    /// Drag anchor in page device px (fixed at mouse-down).
+    anchor: (f32, f32),
+    /// Latest highlight rectangles from the worker (page device px).
+    rects: Vec<(f32, f32, f32, f32)>,
+    /// A drag is currently in progress.
+    dragging: bool,
+    /// Id of the most recent `Select` request (monotonic; lets us drop stale
+    /// results that land out of order during a fast drag).
+    req_id: u64,
+    /// When set, copy the text of the `Selection` response carrying this id
+    /// (set on mouse-up so the copy reflects the final drag position).
+    copy_id: Option<u64>,
+}
+
+impl Selection {
+    /// Whether there's anything to draw.
+    fn is_active(&self) -> bool {
+        !self.rects.is_empty()
+    }
+
+    /// Clear any active selection. Returns whether something was cleared (so the
+    /// caller can mark the frame dirty).
+    fn clear(&mut self) -> bool {
+        let had = self.is_active() || self.dragging;
+        self.rects.clear();
+        self.dragging = false;
+        self.copy_id = None;
+        had
+    }
+}
+
+/// Convert a screen cell `(col, row)` to a page **device-pixel** point, given
+/// the current scale `s`, scroll position, and horizontal centering offset.
+/// Inverse of the draw mapping: page is laid out at device px and shown at
+/// scale `s`, centered at `x_off` cells, with the viewport top at `scroll_rows`.
+fn cell_to_page_px(
+    col: u16,
+    row: u16,
+    x_off: u16,
+    scroll_rows: u32,
+    cell_w: u32,
+    cell_h: u32,
+    s: f32,
+) -> (f32, f32) {
+    let icol = col.saturating_sub(x_off) as f32;
+    let px = icol * cell_w as f32 / s;
+    let py = (scroll_rows as f32 + row as f32) * cell_h as f32 / s;
+    (px, py)
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Render worker
 // ─────────────────────────────────────────────────────────────────────────
@@ -205,6 +280,7 @@ fn render_worker(
     markdown: String,
     style: DocStyle,
     picker: Picker,
+    base_dir: Option<std::path::PathBuf>,
     req_rx: Receiver<Request>,
     resp_tx: Sender<Response>,
 ) {
@@ -214,6 +290,7 @@ fn render_worker(
     let n_elements = elements.len();
     let t_fs = std::time::Instant::now();
     let mut painter = Painter::new();
+    painter.set_base_dir(base_dir);
     let fs_ms = t_fs.elapsed().as_millis();
     let t_begin = std::time::Instant::now();
     let mut doc = painter.begin(elements, &style);
@@ -229,15 +306,31 @@ fn render_worker(
     // Recency-ordered keys of bands already produced (front = oldest).
     let mut produced: Vec<(u32, u32)> = Vec::with_capacity(PRODUCED_CAP);
 
+    // Latest selection request, coalesced across a drag's event stream.
+    let mut pending_select: Option<PendingSelect> = None;
+
     'main: loop {
-        // 1. Drain all queued requests; keep only the latest target.
+        // 1. Drain all queued requests; keep only the latest target / selection.
         loop {
             match req_rx.try_recv() {
                 Ok(Request::Quit) => return,
                 Ok(Request::SetTarget(t)) => target = Some(t),
+                Ok(Request::Select { id, anchor, head }) => {
+                    pending_select = Some((id, anchor, head));
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
+        }
+
+        // 1b. Selection takes priority over band work so a drag feels live.
+        if let Some((id, anchor, head)) = pending_select.take() {
+            let (rects, text) = match doc.select(anchor, head) {
+                Some(s) => (s.rects, s.text),
+                None => (Vec::new(), String::new()),
+            };
+            let _ = resp_tx.send(Response::Selection { id, rects, text });
+            continue 'main;
         }
 
         if let Some(t) = target {
@@ -301,6 +394,9 @@ fn render_worker(
         // 5. Idle (shaped, target served, prefetched) → block for next request.
         match req_rx.recv() {
             Ok(Request::SetTarget(t)) => target = Some(t),
+            Ok(Request::Select { id, anchor, head }) => {
+                pending_select = Some((id, anchor, head));
+            }
             Ok(Request::Quit) | Err(_) => return,
         }
     }
@@ -398,6 +494,7 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     picker: &Picker,
     markdown: &str,
+    base_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let style = DocStyle::light();
     let bg = Color::Rgb(style.bg.0, style.bg.1, style.bg.2);
@@ -415,7 +512,7 @@ fn run_loop(
         let markdown = markdown.to_string();
         let style = style.clone();
         let picker = picker.clone();
-        std::thread::spawn(move || render_worker(markdown, style, picker, req_rx, resp_tx))
+        std::thread::spawn(move || render_worker(markdown, style, picker, base_dir, req_rx, resp_tx))
     };
 
     let result = ui_loop(
@@ -446,6 +543,8 @@ fn ui_loop(
     let mut last_target: Option<Target> = None;
     let mut frame: u64 = 0;
     let mut dirty = true;
+    let mut selection = Selection::default();
+    let mut overlay = super::overlay::Overlay::default();
 
     loop {
         let term = terminal.size()?;
@@ -521,6 +620,18 @@ fn ui_loop(
                     );
                     dirty = true;
                 }
+                Ok(Response::Selection { id, rects, text }) => {
+                    // Only the latest request's result matters; drop stale ones
+                    // from a fast drag so the highlight doesn't flicker backward.
+                    if id == selection.req_id {
+                        selection.rects = rects;
+                        if selection.copy_id == Some(id) {
+                            super::clipboard::copy(&text);
+                            selection.copy_id = None;
+                        }
+                        dirty = true;
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -546,6 +657,12 @@ fn ui_loop(
                 .min_by_key(|b| b.row0.abs_diff(view_top))
         });
         let covered = covering.is_some();
+
+        // Horizontal centering offset (cells) of the page on screen, mirroring
+        // the draw path, so screen↔page-pixel mapping for selection (and the
+        // overlay placement) lines up with the band.
+        let cols_disp = sw.div_ceil(cell_w) as u16;
+        let x_off = term_w.saturating_sub(cols_disp) / 2;
 
         // 4. Draw.
         if dirty {
@@ -600,6 +717,21 @@ fn ui_loop(
                 td.elapsed().as_millis()
             ));
             dirty = false;
+
+            // Selection highlight sits above the band as a separate kitty
+            // placement; refresh it whenever the frame changed (scroll moves the
+            // rects; a drag changes them). Empty rects hide it.
+            let mut out = stdout();
+            overlay.paint(
+                &mut out,
+                &selection.rects,
+                x_off,
+                scroll_rows,
+                cell_h,
+                view_h,
+                sw,
+                s,
+            );
         }
 
         // 5. Input. Poll faster while waiting for the covering band to arrive.
@@ -607,16 +739,73 @@ fn ui_loop(
         let poll_ms = if covered { EVENT_POLL_MS } else { WAIT_POLL_MS };
         if event::poll(Duration::from_millis(poll_ms))? {
             for _ in 0..MAX_EVENTS_PER_FRAME {
-                match handle_event(event::read()?, &mut scroll_rows, max_scroll, page) {
-                    RichEvent::Quit => return Ok(()),
-                    RichEvent::Changed => dirty = true,
-                    RichEvent::Ignored => {}
+                let ev = event::read()?;
+                if handle_selection(
+                    &ev, &mut selection, req_tx, x_off, scroll_rows, cell_w, cell_h, s,
+                ) {
+                    dirty = true;
+                } else {
+                    match handle_event(ev, &mut scroll_rows, max_scroll, page) {
+                        RichEvent::Quit => return Ok(()),
+                        RichEvent::Changed => dirty = true,
+                        RichEvent::Ignored => {}
+                    }
                 }
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }
             }
         }
+    }
+}
+
+/// Handle left-button mouse events that drive text selection. Returns `true` if
+/// the event was a selection event (and thus consumed). Shift+drag never
+/// reaches us — terminals reserve it for native selection — so plain left-drag
+/// is unambiguous here.
+#[allow(clippy::too_many_arguments)]
+fn handle_selection(
+    ev: &Event,
+    selection: &mut Selection,
+    req_tx: &Sender<Request>,
+    x_off: u16,
+    scroll_rows: u32,
+    cell_w: u32,
+    cell_h: u32,
+    s: f32,
+) -> bool {
+    let Event::Mouse(m) = ev else { return false };
+    let point =
+        || cell_to_page_px(m.column, m.row, x_off, scroll_rows, cell_w, cell_h, s);
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            selection.clear();
+            selection.anchor = point();
+            selection.dragging = true;
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) if selection.dragging => {
+            selection.req_id += 1;
+            let _ = req_tx.send(Request::Select {
+                id: selection.req_id,
+                anchor: selection.anchor,
+                head: point(),
+            });
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) if selection.dragging => {
+            selection.dragging = false;
+            // Final resolve; copy when its result returns.
+            selection.req_id += 1;
+            selection.copy_id = Some(selection.req_id);
+            let _ = req_tx.send(Request::Select {
+                id: selection.req_id,
+                anchor: selection.anchor,
+                head: point(),
+            });
+            true
+        }
+        _ => false,
     }
 }
 
@@ -710,7 +899,7 @@ that wraps across the measure to exercise line breaking.\n\n\
         let handle = {
             let style = style.clone();
             let picker = headless_picker();
-            std::thread::spawn(move || render_worker(md, style, picker, req_rx, resp_tx))
+            std::thread::spawn(move || render_worker(md, style, picker, None, req_rx, resp_tx))
         };
 
         let target = Target {
@@ -741,6 +930,7 @@ that wraps across the measure to exercise line breaking.\n\n\
                 Ok(Response::Progress { total_h, .. }) => {
                     assert!(total_h > 0);
                 }
+                Ok(_) => continue,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -763,7 +953,7 @@ that wraps across the measure to exercise line breaking.\n\n\
         let handle = {
             let style = style.clone();
             let picker = headless_picker();
-            std::thread::spawn(move || render_worker(md, style, picker, req_rx, resp_tx))
+            std::thread::spawn(move || render_worker(md, style, picker, None, req_rx, resp_tx))
         };
 
         // row0 far below any real content.
