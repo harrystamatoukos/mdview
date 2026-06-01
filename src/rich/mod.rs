@@ -6,6 +6,7 @@
 //!
 //! Gated behind the `rich` cargo feature so the default build stays lean.
 
+mod chart_render;
 mod clipboard;
 mod overlay;
 mod paint;

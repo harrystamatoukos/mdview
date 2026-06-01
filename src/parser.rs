@@ -4,7 +4,11 @@
 //! were removed with the editor path because read mode never maps screen
 //! positions back to markdown bytes.
 
-use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
+
+use crate::chart::Chart;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ELEMENT - Parsed markdown block
@@ -23,6 +27,11 @@ pub enum Element {
     },
     CodeBlock {
         code: String,
+    },
+    /// A ` ```chart ` block whose YAML parsed into a valid chart spec. Malformed
+    /// chart blocks stay `CodeBlock` so they degrade to legible YAML.
+    Chart {
+        chart: Chart,
     },
     BlockQuote {
         elements: Vec<Element>,
@@ -276,8 +285,22 @@ where
             let spans = collect_spans_until_end(iter, TagEnd::Paragraph);
             Some(Element::Paragraph { spans })
         }
-        Event::Start(Tag::CodeBlock(_)) => {
+        Event::Start(Tag::CodeBlock(kind)) => {
             let code = collect_text_until_end(iter, TagEnd::CodeBlock);
+            // First word of the info string is the language / block type.
+            let lang = match &kind {
+                CodeBlockKind::Fenced(info) => {
+                    info.split_whitespace().next().unwrap_or("").to_string()
+                }
+                CodeBlockKind::Indented => String::new(),
+            };
+            // Invalid chart falls through to a plain code block (fallback
+            // contract: show the YAML rather than erroring).
+            if lang == "chart"
+                && let Some(chart) = Chart::parse(&code)
+            {
+                return Some(Element::Chart { chart });
+            }
             Some(Element::CodeBlock { code })
         }
         Event::Start(Tag::BlockQuote(_)) => {

@@ -1,6 +1,6 @@
 [package]
 name = "mdview"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 authors = ["Harry Stamatoukos"]
 description = "A beautiful terminal markdown viewer with editorial aesthetics"
@@ -27,6 +27,13 @@ clap = { version = "4.5", features = ["derive"] }
 # Error handling
 anyhow = "1.0"
 
+# Chart spec parsing (```chart fenced blocks). serde_yaml_ng is the maintained
+# libyaml-backed fork of the (archived) serde_yaml, same serde API. indexmap
+# preserves pie-slice insertion order from the YAML.
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml_ng = "0.10"
+indexmap = { version = "2.2", features = ["serde"] }
+
 # --- Rich reader mode (--rich): proportional-font page rendering ---
 # Enabled by default; build with --no-default-features for the classic TUI-only binary.
 cosmic-text = { version = "0.19", optional = true }
@@ -42,6 +49,15 @@ image = { version = "0.25", optional = true }
 # Zlib for the kitty `o=z` transmit of the selection-highlight overlay (same
 # compressor the vendored ratatui-image patch uses for bands).
 miniz_oxide = { version = "0.8", optional = true }
+# Native chart rasterization for ```chart blocks (no browser). Pure-Rust font
+# (ab_glyph) so there's no system-font/fontconfig dependency.
+plotters = { version = "0.3", optional = true, default-features = false, features = [
+    "bitmap_backend",
+    "ab_glyph",
+    "line_series",
+    "point_series",
+    "histogram",
+] }
 
 [dev-dependencies]
 # Used by an offline test that verifies a representative rendered band's RGBA
@@ -51,7 +67,7 @@ miniz_oxide = "0.8"
 
 [features]
 default = ["rich"]
-rich = ["dep:cosmic-text", "dep:ratatui-image", "dep:image", "dep:miniz_oxide"]
+rich = ["dep:cosmic-text", "dep:ratatui-image", "dep:image", "dep:miniz_oxide", "dep:plotters"]
 
 [profile.release]
 opt-level = 3

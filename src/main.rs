@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 
+mod chart;
 mod parser;
 mod renderer;
 #[cfg(feature = "rich")]

@@ -1074,6 +1074,27 @@ impl Painter {
                         });
                     }
                 }
+                Element::Chart { chart } => {
+                    // Rasterized to its own bitmap (like tables) and carried as
+                    // an Image decoration over an empty placeholder buffer.
+                    let img = super::chart_render::render_chart(chart, width, st);
+                    let height = img.height();
+                    let (buffer, _) = self.shape(
+                        &[(String::new(), Run { bold: false, italic: false, mono: false, pill: false, color: st.ink })],
+                        st,
+                        Metrics::new(st.base_px, st.base_px),
+                        width,
+                        Align::Left,
+                    );
+                    out.push(Block {
+                        buffer,
+                        line_height: st.base_px,
+                        height,
+                        indent: base_indent,
+                        space_before: st.para_space(),
+                        decorations: vec![Decoration::Image { x: 0, y: 0, img }],
+                    });
+                }
             }
         }
     }

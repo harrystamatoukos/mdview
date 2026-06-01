@@ -191,6 +191,18 @@ fn render_element_styled(
             lines.push(Line::from(""));
         }
 
+        Element::Chart { chart } => {
+            lines.push(Line::from(""));
+            for row in chart_text_lines(chart, width) {
+                let mut builder = LineBuilder::new();
+                builder.push_raw(margin);
+                builder.push("    ", theme.body());
+                builder.push(&row, theme.code_block());
+                lines.push(builder.finish());
+            }
+            lines.push(Line::from(""));
+        }
+
         Element::BlockQuote { elements, .. } => {
             lines.push(Line::from(""));
 
@@ -622,6 +634,14 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
             output.push('\n');
             output
         }
+        Element::Chart { chart } => {
+            let mut output = String::from("\n");
+            for row in chart_text_lines(chart, OPTIMAL_WIDTH) {
+                output.push_str(&format!("{}    {}\n", margin, row));
+            }
+            output.push('\n');
+            output
+        }
         Element::BlockQuote { elements, .. } => {
             let mut output = String::from("\n");
             for el in elements {
@@ -727,4 +747,100 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
             output
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CHART TEXT FALLBACK - charts as text for the --tui and --print readers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Render a chart as plain text rows: ranked block bars for bar/pie, a unicode
+/// sparkline per series for line, a range summary for scatter. "Defined, not
+/// pretty, not broken" — the fallback contract for non-graphical readers.
+fn chart_text_lines(chart: &crate::chart::Chart, width: usize) -> Vec<String> {
+    use crate::chart::{fmt_num, ChartKind};
+
+    let mut out = Vec::new();
+    if let Some(t) = &chart.title {
+        out.push(t.clone());
+        out.push(String::new());
+    }
+    let bar_w = width.clamp(16, 80) / 3; // bar column ≈ a third of the measure
+
+    match chart.kind {
+        ChartKind::Bar => {
+            let max = chart.y_max();
+            let label_w = chart.x.iter().map(|s| s.chars().count()).max().unwrap_or(0).min(18);
+            let single = chart.series.len() <= 1;
+            for series in &chart.series {
+                if !single {
+                    out.push(format!("{}:", series.name));
+                }
+                let pad = if single { "" } else { "  " };
+                for (i, &v) in series.y.iter().enumerate() {
+                    let lbl = chart.x.get(i).cloned().unwrap_or_default();
+                    out.push(format!("{pad}{}", bar_row(&lbl, v, max, label_w, bar_w)));
+                }
+            }
+        }
+        ChartKind::Pie => {
+            let total: f64 = chart.data.iter().map(|(_, v)| *v).sum();
+            let mut rows = chart.data.clone();
+            rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let max = rows.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max).max(f64::MIN_POSITIVE);
+            let label_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0).min(18);
+            for (k, v) in rows {
+                let bars = "█".repeat(((v / max) * bar_w as f64).round() as usize);
+                let pct = if total > 0.0 { v / total * 100.0 } else { 0.0 };
+                out.push(format!("{k:<label_w$} {bars} {} ({pct:.0}%)", fmt_num(v)));
+            }
+        }
+        ChartKind::Line => {
+            for series in &chart.series {
+                let name = if series.name.is_empty() { "series" } else { &series.name };
+                let (mn, mx) = minmax(&series.y);
+                out.push(format!("{name}: {}  ({}..{})", sparkline(&series.y), fmt_num(mn), fmt_num(mx)));
+            }
+        }
+        ChartKind::Scatter => {
+            let xs: Vec<f64> = chart.points.iter().map(|p| p.0).collect();
+            let ys: Vec<f64> = chart.points.iter().map(|p| p.1).collect();
+            let (xmn, xmx) = minmax(&xs);
+            let (ymn, ymx) = minmax(&ys);
+            out.push(format!(
+                "scatter: {} points  (x {}..{}, y {}..{})",
+                chart.points.len(),
+                fmt_num(xmn),
+                fmt_num(xmx),
+                fmt_num(ymn),
+                fmt_num(ymx),
+            ));
+        }
+    }
+    out
+}
+
+/// One labeled horizontal bar: `label  ████ value`.
+fn bar_row(label: &str, v: f64, max: f64, label_w: usize, bar_w: usize) -> String {
+    let n = if max > 0.0 { ((v / max) * bar_w as f64).round() as usize } else { 0 };
+    format!("{label:<label_w$} {} {}", "█".repeat(n), crate::chart::fmt_num(v))
+}
+
+/// A compact unicode sparkline of a numeric series.
+fn sparkline(ys: &[f64]) -> String {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let (mn, mx) = minmax(ys);
+    let range = (mx - mn).max(f64::MIN_POSITIVE);
+    ys.iter()
+        .map(|&v| BLOCKS[(((v - mn) / range) * 7.0).round() as usize % 8])
+        .collect()
+}
+
+/// Min and max of a slice, `(0, 0)` if empty.
+fn minmax(v: &[f64]) -> (f64, f64) {
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mn = v.iter().copied().fold(f64::MAX, f64::min);
+    let mx = v.iter().copied().fold(f64::MIN, f64::max);
+    (mn, mx)
 }

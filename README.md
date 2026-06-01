@@ -72,8 +72,93 @@ mdview --export-png out.png document.md
 ## What it renders
 
 Headings, paragraphs, **bold** / *italic* / `inline code`, links, ordered &
-unordered (nested) lists, blockquotes, fenced code blocks, horizontal rules, and
-tables (tabular when they fit, card layout when too wide).
+unordered (nested) lists, task lists, footnotes, blockquotes, fenced code blocks,
+horizontal rules, tables (tabular when they fit, card layout when too wide), and
+native **charts** (see below).
+
+## Charts
+
+A fenced code block tagged `chart` becomes a native chart — no browser, no
+external process. The body is a small YAML document. Charts render three ways:
+
+- **Graphical reader** — a real rasterized chart, drawn straight into the page.
+- **`--tui` / `--print`** — a text chart: block bars, a unicode sparkline, or a
+  ranked list, depending on the type.
+- **Any other markdown tool (GitHub, etc.)** — the block falls back to a plain
+  code block showing the YAML, which still reads as legible data.
+
+A chart that fails to parse degrades to a code block too, so a deck never breaks.
+
+### Bar
+
+````markdown
+```chart
+type: bar
+title: Weekly active doctors
+xlabel: Day
+ylabel: Count
+x: [Mon, Tue, Wed, Thu, Fri]
+y: [12, 19, 14, 22, 30]
+```
+````
+
+### Line (single or multiple series)
+
+````markdown
+```chart
+type: line
+title: Score over time
+xlabel: Week
+ylabel: Score
+x: [1, 2, 3, 4, 5]
+series:
+  - name: Praxis
+    y: [41, 47, 52, 58, 63]
+  - name: Baseline
+    y: [40, 41, 42, 41, 43]
+```
+````
+
+A single series can skip `series:` and give `y:` directly.
+
+### Pie
+
+````markdown
+```chart
+type: pie
+title: Where the week went
+data:
+  Pipeline: 40
+  Evals: 25
+  Recruiting: 20
+  Meetings: 15
+```
+````
+
+### Scatter
+
+````markdown
+```chart
+type: scatter
+title: Dose vs response
+xlabel: Dose
+ylabel: Response
+points: [[1, 2], [2, 3.5], [3, 3], [4, 5], [5, 4.5]]
+```
+````
+
+### Fields
+
+| Field | Applies to | Meaning |
+|-------|-----------|---------|
+| `type` | all | `bar`, `line`, `scatter`, or `pie`. **Required.** |
+| `title` | all | Chart title. Optional. |
+| `xlabel`, `ylabel` | bar, line, scatter | Axis titles. Optional. |
+| `x` | bar, line | Category labels (text or numbers). |
+| `y` | bar, line | Values for a single series. |
+| `series` | bar, line | List of `{ name, y }` for multiple series. |
+| `points` | scatter | List of `[x, y]` pairs. |
+| `data` | pie | Map of label to number (slices keep their order). |
 
 ## Notes
 
