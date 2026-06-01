@@ -15,7 +15,7 @@ mod view;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-pub use paint::{DocStyle, Painter, RichDoc};
+pub use paint::{CaretMotion, DocStyle, Painter, RichDoc};
 pub use view::run;
 
 /// Lay out the document once (shaping + positioning, no rasterization).

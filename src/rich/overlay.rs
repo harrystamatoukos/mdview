@@ -26,6 +26,10 @@ const OVERLAY_ID: u32 = 0x7FFF_FF00;
 
 /// Translucent selection tint (RGBA), alpha-blended over the page by kitty.
 const TINT: Rgba<u8> = Rgba([74, 144, 226, 90]);
+/// Opaque keyboard-caret bar (RGBA) — a clearly visible cursor over the page.
+const CARET: Rgba<u8> = Rgba([26, 95, 180, 255]);
+/// Faint full-width band on the caret's line, so the cursor is easy to track.
+const CARET_LINE: Rgba<u8> = Rgba([74, 144, 226, 26]);
 
 /// Manages the lifecycle of the on-screen highlight placement.
 #[derive(Default)]
@@ -44,6 +48,7 @@ impl Overlay {
         &mut self,
         out: &mut W,
         rects: &[(f32, f32, f32, f32)],
+        caret: Option<(f32, f32, f32, f32)>,
         x_off: u16,
         scroll_rows: u32,
         cell_h: u32,
@@ -51,7 +56,7 @@ impl Overlay {
         page_w_disp: u32,
         s: f32,
     ) {
-        if rects.is_empty() {
+        if rects.is_empty() && caret.is_none() {
             self.hide(out);
             return;
         }
@@ -62,6 +67,28 @@ impl Overlay {
 
         // Display-pixel offset of the viewport top within the document.
         let scroll_px = (scroll_rows * cell_h) as f32;
+        let fill = |img: &mut RgbaImage, x0: u32, x1: u32, y0: u32, y1: u32, c: Rgba<u8>| {
+            for y in y0..y1.min(h) {
+                for x in x0..x1.min(w) {
+                    img.put_pixel(x, y, c);
+                }
+            }
+        };
+        // Caret line dimensions (display px → viewport-local), reused below.
+        let caret_rows = caret.map(|(cx, cy, _cw, ch)| {
+            let x0 = (cx * s).floor().max(0.0) as u32;
+            let y0 = (cy * s - scroll_px).floor().clamp(0.0, h as f32) as u32;
+            let y1 = ((cy + ch) * s - scroll_px).ceil().clamp(0.0, h as f32) as u32;
+            (x0, y0, y1)
+        });
+
+        // 1. Faint full-width band on the caret's line (under the selection, so a
+        //    highlight on that line still reads strongly).
+        if let Some((_, y0, y1)) = caret_rows {
+            fill(&mut img, 0, w, y0, y1, CARET_LINE);
+        }
+
+        // 2. Selection highlight.
         for &(rx, ry, rw, rh) in rects {
             // device px → display px, then into viewport-local coordinates.
             let x0 = (rx * s).floor().max(0.0) as u32;
@@ -70,11 +97,13 @@ impl Overlay {
             let y1f = (ry + rh) * s - scroll_px;
             let y0 = y0f.floor().clamp(0.0, h as f32) as u32;
             let y1 = y1f.ceil().clamp(0.0, h as f32) as u32;
-            for y in y0..y1.min(h) {
-                for x in x0..x1.min(w) {
-                    img.put_pixel(x, y, TINT);
-                }
-            }
+            fill(&mut img, x0, x1, y0, y1, TINT);
+        }
+
+        // 3. Caret bar on top (opaque, ≥3 display px so it never vanishes).
+        if let Some((x0, y0, y1)) = caret_rows {
+            let bar = (3.0 * s).round().max(3.0) as u32;
+            fill(&mut img, x0, x0 + bar, y0, y1, CARET);
         }
 
         let seq = transmit_classic(&img, OVERLAY_ID);

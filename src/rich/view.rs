@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -48,7 +48,7 @@ use ratatui_image::{
 };
 use std::path::{Path, PathBuf};
 
-use super::{DocStyle, Painter, RichDoc};
+use super::{CaretMotion, DocStyle, Painter, RichDoc};
 use crate::filetree::FileTree;
 
 /// A point in page device pixels.
@@ -215,6 +215,13 @@ enum Request {
         markdown: String,
         base_dir: Option<PathBuf>,
     },
+    /// Move/act the keyboard caret. `id` lets the UI drop stale results; `top` is
+    /// the viewport top in page px, used to place the caret on first use.
+    Caret {
+        id: u64,
+        motion: CaretMotion,
+        top: u32,
+    },
     Quit,
 }
 
@@ -240,6 +247,15 @@ enum Response {
         id: u64,
         rects: Vec<(f32, f32, f32, f32)>,
         text: String,
+    },
+    /// Keyboard caret state after an action: the caret bar rect (None = hidden),
+    /// selection highlight rects, and copy text (only on a Copy action).
+    Caret {
+        epoch: u64,
+        id: u64,
+        caret: Option<(f32, f32, f32, f32)>,
+        rects: Vec<(f32, f32, f32, f32)>,
+        copy_text: Option<String>,
     },
 }
 
@@ -372,6 +388,10 @@ fn render_worker(
 
     // Latest selection request, coalesced across a drag's event stream.
     let mut pending_select: Option<PendingSelect> = None;
+    // Queued caret actions, applied in order (NOT coalesced — dropping a `v`
+    // before a move, or a `y`, would corrupt the selection flow). Movement
+    // flooding is bounded because we render only the final state.
+    let mut pending_caret: Vec<(u64, CaretMotion, u32)> = Vec::new();
 
     'main: loop {
         // 1. Drain all queued requests; keep only the latest target / selection.
@@ -382,6 +402,9 @@ fn render_worker(
                 Ok(Request::Select { id, anchor, head }) => {
                     pending_select = Some((id, anchor, head));
                 }
+                Ok(Request::Caret { id, motion, top }) => {
+                    pending_caret.push((id, motion, top));
+                }
                 Ok(Request::Load { epoch: g, markdown, base_dir }) => {
                     // Switch documents: re-lay out on the existing painter, then
                     // forget everything tied to the old doc.
@@ -389,6 +412,7 @@ fn render_worker(
                     doc = reload_doc(&mut painter, &style, &markdown, base_dir);
                     produced.clear();
                     pending_select = None;
+                    pending_caret.clear();
                     target = None;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -396,13 +420,33 @@ fn render_worker(
             }
         }
 
-        // 1b. Selection takes priority over band work so a drag feels live.
+        // 1b. Selection / caret take priority over band work so they feel live.
         if let Some((id, anchor, head)) = pending_select.take() {
             let (rects, text) = match doc.select(anchor, head) {
                 Some(s) => (s.rects, s.text),
                 None => (Vec::new(), String::new()),
             };
             let _ = resp_tx.send(Response::Selection { epoch, id, rects, text });
+            continue 'main;
+        }
+        if !pending_caret.is_empty() {
+            // Apply every queued action in order; render only the final state,
+            // but surface any copy text produced along the way.
+            let batch = std::mem::take(&mut pending_caret);
+            let mut last_id = 0;
+            let mut caret = None;
+            let mut rects = Vec::new();
+            let mut copy_text = None;
+            for (id, motion, top) in batch {
+                let r = painter.caret_apply(&mut doc, motion, top);
+                last_id = id;
+                caret = r.caret;
+                rects = r.rects;
+                if r.copy_text.is_some() {
+                    copy_text = r.copy_text;
+                }
+            }
+            let _ = resp_tx.send(Response::Caret { epoch, id: last_id, caret, rects, copy_text });
             continue 'main;
         }
 
@@ -473,11 +517,15 @@ fn render_worker(
             Ok(Request::Select { id, anchor, head }) => {
                 pending_select = Some((id, anchor, head));
             }
+            Ok(Request::Caret { id, motion, top }) => {
+                pending_caret.push((id, motion, top));
+            }
             Ok(Request::Load { epoch: g, markdown, base_dir }) => {
                 epoch = g;
                 doc = reload_doc(&mut painter, &style, &markdown, base_dir);
                 produced.clear();
                 pending_select = None;
+                pending_caret.clear();
                 target = None;
             }
             Ok(Request::Quit) | Err(_) => return,
@@ -620,6 +668,83 @@ enum Focus {
     Sidebar,
 }
 
+/// File-search input state, orthogonal to [`Focus`]. `Typing` captures all
+/// keystrokes into the query; `Results` means the sidebar shows the ranked hits
+/// (navigated as the `Sidebar` focus) and remembers the query for the status row.
+enum Search {
+    Idle,
+    Typing(String),
+    Results { query: String, truncated: bool },
+}
+
+impl Search {
+    fn is_typing(&self) -> bool {
+        matches!(self, Search::Typing(_))
+    }
+    fn is_active(&self) -> bool {
+        !matches!(self, Search::Idle)
+    }
+}
+
+/// UI-side echo of the worker's caret: the latest caret bar + selection rects
+/// (page device px) and a monotonic request id for stale-result dropping.
+#[derive(Default)]
+struct CaretUi {
+    /// In cursor mode (opt-in): reading keys move the caret instead of scrolling.
+    mode: bool,
+    /// A visual selection is being extended (anchor dropped).
+    selecting: bool,
+    rect: Option<(f32, f32, f32, f32)>,
+    sel: Vec<(f32, f32, f32, f32)>,
+    shown: bool,
+    req_id: u64,
+}
+
+impl CaretUi {
+    /// Leave cursor mode and stop drawing the caret/selection. Bumping `req_id`
+    /// drops any in-flight worker response.
+    fn exit(&mut self) {
+        self.mode = false;
+        self.selecting = false;
+        self.rect = None;
+        self.sel.clear();
+        self.shown = false;
+        self.req_id += 1;
+    }
+
+    /// Forget everything on file switch (the worker resets its own caret on Load).
+    fn reset(&mut self) {
+        self.exit();
+    }
+}
+
+/// Map a key event to a caret motion (Reader focus only). `None` for keys that
+/// aren't caret commands (so they fall through to scroll/selection handling).
+fn caret_key(ev: &Event) -> Option<CaretMotion> {
+    let Event::Key(k) = ev else { return None };
+    if k.kind != KeyEventKind::Press {
+        return None;
+    }
+    // Option(⌥)+←/→ jumps/extends by word (the macOS word modifier; Cmd can't
+    // reach a terminal app). Arrives as ALT via the standard CSI encoding.
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    Some(match k.code {
+        KeyCode::Left if alt => CaretMotion::WordPrev,
+        KeyCode::Right if alt => CaretMotion::WordNext,
+        KeyCode::Left | KeyCode::Char('h') => CaretMotion::Left,
+        KeyCode::Right | KeyCode::Char('l') => CaretMotion::Right,
+        KeyCode::Up | KeyCode::Char('k') => CaretMotion::Up,
+        KeyCode::Down | KeyCode::Char('j') => CaretMotion::Down,
+        KeyCode::Char('w') => CaretMotion::WordNext,
+        KeyCode::Char('b') => CaretMotion::WordPrev,
+        KeyCode::Char('g') | KeyCode::Home => CaretMotion::DocStart,
+        KeyCode::Char('G') | KeyCode::End => CaretMotion::DocEnd,
+        KeyCode::Char('v') => CaretMotion::VisualStart,
+        KeyCode::Char('y') | KeyCode::Enter => CaretMotion::Copy,
+        _ => return None,
+    })
+}
+
 /// The per-frame device-pixel geometry: the single source of truth for the
 /// width-fit scale, the page's horizontal placement, and band slotting. Every
 /// consumer (the band draw, `cell_to_page_px`, the selection overlay, and the
@@ -726,6 +851,8 @@ fn switch_to(
     selection: &mut Selection,
     overlay: &mut super::overlay::Overlay,
     title: &mut String,
+    current_path: &mut Option<PathBuf>,
+    caret: &mut CaretUi,
 ) {
     let name = path
         .file_name()
@@ -749,7 +876,9 @@ fn switch_to(
             selection.req_id += 1;
             selection.clear();
             overlay.hide(&mut stdout());
+            caret.reset();
             *title = name;
+            *current_path = Some(path.to_path_buf());
         }
         Err(e) => {
             *title = format!("⚠ cannot open {name}: {e}");
@@ -801,11 +930,16 @@ fn draw_sidebar(
         } else {
             Style::default().fg(ink)
         };
-        let mut line = Line::from(vec![
+        let mut spans = vec![
             Span::raw(indent),
             Span::styled(glyph, Style::default().fg(dim)),
             Span::styled(r.name.clone(), name_style),
-        ]);
+        ];
+        // Search results carry a dimmed locator ("parent · N matches").
+        if let Some(detail) = &r.detail {
+            spans.push(Span::styled(format!("  {detail}"), Style::default().fg(dim)));
+        }
+        let mut line = Line::from(spans);
         if idx == selected {
             let mut st = Style::default().bg(sel_bg);
             if focused {
@@ -845,6 +979,11 @@ fn ui_loop(
     let mut overlay = super::overlay::Overlay::default();
     let mut doc_gen: u64 = 0;
     let mut focus = Focus::Reader;
+    let mut search = Search::Idle;
+    let mut caret = CaretUi::default();
+    // Full path of the file currently shown — so clearing a search can reveal it
+    // back in the tree. Seeded from the tree's initial selection.
+    let mut current_path: Option<PathBuf> = tree.selected_path().map(|p| p.to_path_buf());
     // Persistent sidebar whenever there are files to browse.
     let sidebar_enabled = !tree.is_empty();
 
@@ -864,9 +1003,15 @@ fn ui_loop(
         } else {
             0
         };
-        // If the sidebar collapsed away, keystrokes belong to the reader.
+        // If the sidebar collapsed away, keystrokes belong to the reader and any
+        // active search is abandoned (its results would be invisible).
         if sidebar_w == 0 {
             focus = Focus::Reader;
+            if search.is_active() {
+                tree.clear_search(current_path.as_deref());
+                search = Search::Idle;
+                dirty = true;
+            }
         }
 
         let layout = Layout::compute(
@@ -937,6 +1082,30 @@ fn ui_loop(
                         dirty = true;
                     }
                 }
+                Ok(Response::Caret { epoch, id, caret: crect, rects, copy_text }) => {
+                    if epoch == doc_gen && id == caret.req_id {
+                        caret.rect = crect;
+                        caret.sel = rects;
+                        caret.shown = crect.is_some();
+                        if let Some(text) = copy_text {
+                            super::clipboard::copy(&text);
+                        }
+                        // Scroll the page so the caret line stays visible.
+                        if let Some((_, cy, _, ch)) = crect {
+                            let s = layout.s;
+                            let top = ((cy * s) / cell_h as f32).floor() as u32;
+                            let bottom = (((cy + ch) * s) / cell_h as f32).ceil() as u32;
+                            let margin = 2u32;
+                            if top < scroll_rows + margin {
+                                scroll_rows = top.saturating_sub(margin);
+                            } else if bottom + margin > scroll_rows + view_h as u32 {
+                                scroll_rows = (bottom + margin).saturating_sub(view_h as u32);
+                            }
+                            scroll_rows = scroll_rows.min(max_scroll);
+                        }
+                        dirty = true;
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -982,12 +1151,36 @@ fn ui_loop(
             } else {
                 ""
             };
-            let hint = match focus {
-                Focus::Sidebar => "↑/↓ select · ⏎ open · Tab read · q quit",
-                Focus::Reader => "Tab files · j/k scroll · space page · g/G ends · q quit",
+            // The status row doubles as the search bar while searching.
+            let status = match &search {
+                Search::Typing(q) => format!(" /{q}▏    ⏎ search · Esc cancel "),
+                Search::Results { query, truncated } => {
+                    let n = tree.visible().len();
+                    let trunc = if *truncated { " · capped" } else { "" };
+                    if n == 0 {
+                        format!(" no matches for \"{query}\"{trunc}    Esc clear ")
+                    } else {
+                        format!(
+                            " {n} match{} for \"{query}\"{trunc}    ↑/↓ · ⏎ open · Esc clear ",
+                            if n == 1 { "" } else { "es" }
+                        )
+                    }
+                }
+                Search::Idle if caret.mode && caret.selecting => {
+                    " SELECT · move · w/b by word · y copy · v stop · Esc cancel ".to_string()
+                }
+                Search::Idle if caret.mode => {
+                    " CURSOR · arrows move · w/b word · v select · Esc exit ".to_string()
+                }
+                Search::Idle => {
+                    let hint = match focus {
+                        Focus::Sidebar => "↑/↓ select · ⏎ open · / find · Tab read · q quit",
+                        Focus::Reader => "Tab files · / find · v cursor · j/k scroll · q quit",
+                    };
+                    let name = if title.is_empty() { "reading" } else { title.as_str() };
+                    format!(" mdview · {name} · {pct}%{state}    {hint} ")
+                }
             };
-            let name = if title.is_empty() { "reading" } else { title.as_str() };
-            let status = format!(" mdview · {name} · {pct}%{state}    {hint} ");
             let status_rect = Rect::new(0, term_h.saturating_sub(1), term_w, 1);
             let full = Rect::new(0, 0, term_w, view_h);
             let sidebar_focused = focus == Focus::Sidebar;
@@ -1037,15 +1230,19 @@ fn ui_loop(
             ));
             dirty = false;
 
-            // Selection highlight sits above the band as a separate kitty
-            // placement; refresh it whenever the frame changed (scroll moves the
-            // rects; a drag changes them). Empty rects hide it. Width is clamped
-            // to the content area so a clipped narrow page doesn't tint past it.
+            // Selection highlight + keyboard caret sit above the band as a
+            // separate kitty placement; refreshed whenever the frame changed.
+            // Width is clamped to the content area so a clipped narrow page
+            // doesn't tint past it.
             let mut out = stdout();
             let overlay_w = layout.sw.min(content_w_px);
+            // Mouse-drag and keyboard-visual highlights share one tint layer.
+            let mut sel_rects = selection.rects.clone();
+            sel_rects.extend_from_slice(&caret.sel);
             overlay.paint(
                 &mut out,
-                &selection.rects,
+                &sel_rects,
+                caret.rect,
                 x_off,
                 scroll_rows,
                 cell_h,
@@ -1062,12 +1259,86 @@ fn ui_loop(
             for _ in 0..MAX_EVENTS_PER_FRAME {
                 let ev = event::read()?;
 
-                // Global keys (regardless of focus): quit, focus toggle. Resize
-                // just needs a redraw.
+                // While the search bar is open, key events build the query and
+                // shadow everything else (so `q`, `j/k`, `Tab` are literal text).
+                // Non-key events (mouse/resize) still fall through below.
+                if search.is_typing()
+                    && let Event::Key(k) = &ev
+                {
+                    if k.kind == KeyEventKind::Press {
+                        let Search::Typing(mut q) = std::mem::replace(&mut search, Search::Idle)
+                        else {
+                            unreachable!("is_typing() checked above")
+                        };
+                        match k.code {
+                            KeyCode::Esc => {
+                                if tree.is_searching() {
+                                    tree.clear_search(current_path.as_deref());
+                                }
+                                // search stays Idle (cancelled).
+                            }
+                            KeyCode::Enter => {
+                                if q.trim().is_empty() {
+                                    if tree.is_searching() {
+                                        tree.clear_search(current_path.as_deref());
+                                    }
+                                } else {
+                                    let outcome = tree.set_search(&q);
+                                    focus = Focus::Sidebar;
+                                    search = Search::Results {
+                                        query: q,
+                                        truncated: outcome.truncated,
+                                    };
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                q.pop();
+                                search = Search::Typing(q);
+                            }
+                            KeyCode::Char(c) if !c.is_control() => {
+                                q.push(c);
+                                search = Search::Typing(q);
+                            }
+                            _ => search = Search::Typing(q), // unchanged
+                        }
+                        dirty = true;
+                    }
+                    // Key consumed by the search bar.
+                    if !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Global keys (regardless of focus): quit, focus toggle, search.
+                // Resize just needs a redraw.
                 let mut handled = false;
                 match &ev {
                     Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                        // Esc unwinds in order: close search, else hide the
+                        // caret, else quit.
+                        KeyCode::Esc if search.is_active() => {
+                            tree.clear_search(current_path.as_deref());
+                            search = Search::Idle;
+                            dirty = true;
+                            handled = true;
+                        }
+                        KeyCode::Esc if caret.mode => {
+                            caret.exit();
+                            let _ = req_tx.send(Request::Caret {
+                                id: caret.req_id,
+                                motion: CaretMotion::Hide,
+                                top: 0,
+                            });
+                            dirty = true;
+                            handled = true;
+                        }
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('/') if sidebar_w > 0 => {
+                            search = Search::Typing(String::new());
+                            dirty = true;
+                            handled = true;
+                        }
                         KeyCode::Tab | KeyCode::BackTab => {
                             if sidebar_w > 0 {
                                 focus = match focus {
@@ -1105,6 +1376,7 @@ fn ui_loop(
                                         &mut scroll_rows, &mut doc_total_h,
                                         &mut fully_shaped, &mut last_target,
                                         &mut selection, &mut overlay, &mut title,
+                                        &mut current_path, &mut caret,
                                     );
                                 }
                                 dirty = true;
@@ -1150,6 +1422,7 @@ fn ui_loop(
                                             &mut scroll_rows, &mut doc_total_h,
                                             &mut fully_shaped, &mut last_target,
                                             &mut selection, &mut overlay, &mut title,
+                                            &mut current_path, &mut caret,
                                         );
                                     }
                                     dirty = true;
@@ -1157,6 +1430,45 @@ fn ui_loop(
                                 _ => {}
                             }
                         }
+                    } else if focus == Focus::Reader
+                        && !caret.mode
+                        && matches!(&ev, Event::Key(k)
+                            if k.kind == KeyEventKind::Press && k.code == KeyCode::Char('v'))
+                    {
+                        // Opt-in: `v` enters cursor mode at the top of the viewport.
+                        // Reading keys keep scrolling until then.
+                        caret.mode = true;
+                        caret.selecting = false;
+                        caret.req_id += 1;
+                        let top = (scroll_rows as f32 * cell_h as f32 / s).max(0.0) as u32;
+                        let _ = req_tx.send(Request::Caret {
+                            id: caret.req_id,
+                            motion: CaretMotion::Show,
+                            top,
+                        });
+                        dirty = true;
+                    } else if focus == Focus::Reader
+                        && caret.mode
+                        && let Some(motion) = caret_key(&ev)
+                    {
+                        // In cursor mode: caret keys move/select; the view follows.
+                        caret.req_id += 1;
+                        let top = (scroll_rows as f32 * cell_h as f32 / s).max(0.0) as u32;
+                        let _ = req_tx.send(Request::Caret { id: caret.req_id, motion, top });
+                        match motion {
+                            CaretMotion::VisualStart => caret.selecting = !caret.selecting,
+                            CaretMotion::Copy => {
+                                // Copy exits cursor mode; the response clears the
+                                // caret + does the clipboard write.
+                                caret.mode = false;
+                                caret.selecting = false;
+                                caret.rect = None;
+                                caret.sel.clear();
+                                caret.shown = false;
+                            }
+                            _ => {}
+                        }
+                        dirty = true;
                     } else if handle_selection(
                         &ev, &mut selection, req_tx, x_off, scroll_rows, cell_w, cell_h, s,
                     ) {

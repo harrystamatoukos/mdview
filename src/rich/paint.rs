@@ -12,8 +12,8 @@
 //! * Generous page margins / whitespace
 
 use cosmic_text::{
-    Align, Attrs, Buffer, Color, Cursor, Family, FontSystem, Metrics, Shaping, Style as FontStyle,
-    SwashCache, Weight,
+    Align, Attrs, Buffer, Color, Cursor, Family, FontSystem, Metrics, Motion, Shaping,
+    Style as FontStyle, SwashCache, Weight,
 };
 use image::{imageops, imageops::FilterType, Rgba, RgbaImage};
 
@@ -295,6 +295,56 @@ struct Placed {
     height: u32,
     indent: u32,
     decorations: Vec<Decoration>,
+    /// Whether this block holds navigable text. False for tables/charts/images/
+    /// rules (empty placeholder buffer, content in `decorations`) and list
+    /// markers (`height == 0`) — the keyboard caret skips these.
+    text: bool,
+}
+
+/// A keyboard caret position within the document, plus optional visual-mode
+/// selection anchor. Lives in [`RichDoc`] because it indexes into the shaped
+/// `blocks` (and their cosmic-text buffers).
+struct Caret {
+    /// Index into `RichDoc::blocks` (always a text block).
+    block: usize,
+    cursor: Cursor,
+    /// Desired horizontal position in page device px, preserved across vertical
+    /// motion (cosmic's own `cursor_x_opt` is a glyph index, not pixels).
+    desired_x: Option<f32>,
+    /// Visual-mode anchor `(block, cursor)`. `Some` ⇒ a selection is active.
+    anchor: Option<(usize, Cursor)>,
+}
+
+/// High-level caret action requested by the UI. Mapped to `cosmic_text::Motion`
+/// (or selection/visual state changes) inside the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaretMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    WordPrev,
+    WordNext,
+    DocStart,
+    DocEnd,
+    /// Enter cursor mode: (re)place the caret at the viewport top, no selection.
+    Show,
+    /// `v`: toggle the visual-mode anchor at the caret.
+    VisualStart,
+    /// `y`/Enter: copy the current selection (if any), then exit the cursor.
+    Copy,
+    /// `Esc`: hide the caret and drop any selection.
+    Hide,
+}
+
+/// What the caret produces for the UI after an action: the caret bar rect, the
+/// selection highlight rects, and copy text (only on a [`CaretMotion::Copy`]).
+/// All rects are page device px `(x, y, w, h)`; caret `w` is 0 (the overlay
+/// draws it as a fixed-width bar).
+pub struct CaretRender {
+    pub caret: Option<(f32, f32, f32, f32)>,
+    pub rects: Vec<(f32, f32, f32, f32)>,
+    pub copy_text: Option<String>,
 }
 
 /// A laid-out document. Shaping happens **incrementally** (one top-level
@@ -324,6 +374,8 @@ pub struct RichDoc {
     shaped_h: u32,
     /// True once every element has been shaped; `total_h` is then exact.
     fully_shaped: bool,
+    /// Keyboard caret + visual-selection state. `None` until the first caret key.
+    caret: Option<Caret>,
 }
 
 /// The result of resolving a selection against the laid-out document: the
@@ -348,6 +400,17 @@ impl RichDoc {
     pub fn select(&self, anchor: (f32, f32), head: (f32, f32)) -> Option<SelectionRender> {
         let a = self.resolve(anchor)?;
         let b = self.resolve(head)?;
+        Some(self.select_cursors(a, b))
+    }
+
+    /// Build highlight rects + copyable text between two `(block, cursor)`
+    /// endpoints (given in any order). Shared by mouse selection and the
+    /// keyboard caret's visual mode.
+    pub fn select_cursors(
+        &self,
+        a: (usize, Cursor),
+        b: (usize, Cursor),
+    ) -> SelectionRender {
         // Order by (block, line, index) so start <= end.
         let (start, end) = if (a.0, a.1.line, a.1.index) <= (b.0, b.1.line, b.1.index) {
             (a, b)
@@ -358,7 +421,7 @@ impl RichDoc {
         let mut rects = Vec::new();
         let mut text = String::new();
         for bi in start.0..=end.0 {
-            let block = &self.blocks[bi];
+            let Some(block) = self.blocks.get(bi) else { break };
             let ox = (self.margin_px + block.indent) as f32;
             let last = block_end_cursor(&block.buffer);
             let cs = if bi == start.0 { start.1 } else { Cursor::new(0, 0) };
@@ -378,7 +441,46 @@ impl RichDoc {
             text.push_str(&block_text(&block.buffer, cs, ce));
         }
 
-        Some(SelectionRender { rects, text })
+        SelectionRender { rects, text }
+    }
+
+    /// Caret bar rect in page device px (`w` left 0 — the overlay draws a fixed
+    /// bar). `None` when the caret is hidden.
+    pub fn caret_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let c = self.caret.as_ref()?;
+        let block = self.blocks.get(c.block)?;
+        let (x, top, lh) = cursor_geom(&block.buffer, &c.cursor)?;
+        let ox = (self.margin_px + block.indent) as f32;
+        Some((ox + x, block.y_top as f32 + top, 0.0, lh))
+    }
+
+    /// Highlight rects for the active visual selection (empty if none).
+    pub fn selection_rects(&self) -> Vec<(f32, f32, f32, f32)> {
+        match self.caret.as_ref() {
+            Some(c) => match c.anchor {
+                Some(anchor) => self.select_cursors(anchor, (c.block, c.cursor)).rects,
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        }
+    }
+
+    /// Text of the active visual selection (`None` if there is no selection).
+    pub fn selection_text(&self) -> Option<String> {
+        let c = self.caret.as_ref()?;
+        let anchor = c.anchor?;
+        let s = self.select_cursors(anchor, (c.block, c.cursor));
+        (!s.text.is_empty()).then_some(s.text)
+    }
+
+    /// Toggle the visual-mode anchor at the current caret (no-op if hidden).
+    fn toggle_anchor(&mut self) {
+        if let Some(c) = self.caret.as_mut() {
+            c.anchor = match c.anchor {
+                Some(_) => None,
+                None => Some((c.block, c.cursor)),
+            };
+        }
     }
 
     /// Map a page-pixel point to the block it falls in and the text cursor
@@ -442,6 +544,40 @@ fn block_text(buffer: &Buffer, cs: Cursor, ce: Cursor) -> String {
         s.push_str(l.text().get(..ce.index).unwrap_or(""));
     }
     s
+}
+
+/// Whether a buffer holds any non-whitespace text (distinguishes real text
+/// blocks from the empty placeholder buffers of tables/charts/images/rules).
+fn buffer_has_text(buffer: &Buffer) -> bool {
+    buffer.lines.iter().any(|l| !l.text().trim().is_empty())
+}
+
+/// Caret geometry within a buffer: `(x, line_top, line_height)` for `cursor`,
+/// in the buffer's local coordinates. `None` if the cursor's line isn't laid out.
+fn cursor_geom(buffer: &Buffer, cursor: &Cursor) -> Option<(f32, f32, f32)> {
+    buffer
+        .layout_runs()
+        .filter(|run| run.line_i == cursor.line)
+        .find_map(|run| run.cursor_position(cursor).map(|x| (x, run.line_top, run.line_height)))
+}
+
+/// First/last/adjacent **text** block indices (the caret only rests on these).
+fn first_text_block(blocks: &[Placed]) -> Option<usize> {
+    blocks.iter().position(|b| b.text)
+}
+fn last_text_block(blocks: &[Placed]) -> Option<usize> {
+    blocks.iter().rposition(|b| b.text)
+}
+fn next_text_block(blocks: &[Placed], from: usize) -> Option<usize> {
+    blocks
+        .iter()
+        .enumerate()
+        .skip(from + 1)
+        .find(|(_, b)| b.text)
+        .map(|(i, _)| i)
+}
+fn prev_text_block(blocks: &[Placed], from: usize) -> Option<usize> {
+    blocks.get(..from).and_then(|s| s.iter().rposition(|b| b.text))
 }
 
 impl Painter {
@@ -509,6 +645,7 @@ impl Painter {
             next_el: 0,
             shaped_h: st.pad_px,
             fully_shaped: false,
+            caret: None,
         }
     }
 
@@ -549,6 +686,192 @@ impl Painter {
         }
     }
 
+    // ── Keyboard caret ──────────────────────────────────────────────────────
+
+    /// Apply a caret action and return what to draw (caret bar + selection +
+    /// copy text). `hint_y` is the viewport top in page px, used to place the
+    /// caret on first use near where the reader is looking.
+    pub fn caret_apply(
+        &mut self,
+        doc: &mut RichDoc,
+        action: CaretMotion,
+        hint_y: u32,
+    ) -> CaretRender {
+        match action {
+            CaretMotion::Hide => {
+                doc.caret = None;
+            }
+            CaretMotion::Show => {
+                // (Re)enter cursor mode at the top of the viewport, no selection.
+                self.spawn_caret(doc, hint_y);
+            }
+            CaretMotion::VisualStart => {
+                if doc.caret.is_none() {
+                    self.spawn_caret(doc, hint_y);
+                }
+                doc.toggle_anchor();
+            }
+            CaretMotion::Copy => {
+                // Copy the selection (if any), then leave cursor mode.
+                let copy_text = doc.selection_text();
+                doc.caret = None;
+                return CaretRender { caret: None, rects: Vec::new(), copy_text };
+            }
+            _ => {
+                if doc.caret.is_none() {
+                    self.spawn_caret(doc, hint_y);
+                }
+                self.move_caret(doc, action);
+            }
+        }
+        CaretRender {
+            caret: doc.caret_rect(),
+            rects: doc.selection_rects(),
+            copy_text: None,
+        }
+    }
+
+    /// Place the caret on the first text block at/after `hint_y` (so it appears
+    /// where the reader is looking), else the first text block in the document.
+    fn spawn_caret(&mut self, doc: &mut RichDoc, hint_y: u32) {
+        let block = doc
+            .blocks
+            .iter()
+            .enumerate()
+            .find(|(_, b)| b.text && b.y_top + b.height > hint_y)
+            .map(|(i, _)| i)
+            .or_else(|| first_text_block(&doc.blocks));
+        if let Some(block) = block {
+            let b = &doc.blocks[block];
+            let local_y = (hint_y.saturating_sub(b.y_top) as f32)
+                .min(b.height.saturating_sub(1) as f32);
+            let cursor = b.buffer.hit(0.0, local_y).unwrap_or(Cursor::new(0, 0));
+            doc.caret = Some(Caret { block, cursor, desired_x: None, anchor: None });
+        }
+    }
+
+    /// Shape forward until a text block exists after `block` (or the document is
+    /// fully shaped) — so downward/forward motion can cross into not-yet-shaped
+    /// content.
+    fn ensure_text_after(&mut self, doc: &mut RichDoc, block: usize) {
+        let mut guard = 0;
+        while !doc.fully_shaped
+            && next_text_block(&doc.blocks, block).is_none()
+            && guard < 512
+        {
+            self.shape_step(doc, 4);
+            guard += 1;
+        }
+    }
+
+    /// Move the caret by one motion, crossing block boundaries when cosmic-text
+    /// reports no progress within the current block.
+    fn move_caret(&mut self, doc: &mut RichDoc, action: CaretMotion) {
+        let Some(mut c) = doc.caret.take() else { return };
+        match action {
+            CaretMotion::Left | CaretMotion::WordPrev => {
+                let m = if action == CaretMotion::Left { Motion::Left } else { Motion::PreviousWord };
+                let moved = doc.blocks[c.block]
+                    .buffer
+                    .cursor_motion(&mut self.font_system, c.cursor, None, m)
+                    .filter(|(nc, _)| *nc != c.cursor);
+                match moved {
+                    Some((nc, _)) => c.cursor = nc,
+                    None => {
+                        if let Some(pb) = prev_text_block(&doc.blocks, c.block) {
+                            c.block = pb;
+                            c.cursor = block_end_cursor(&doc.blocks[pb].buffer);
+                        }
+                    }
+                }
+                c.desired_x = None;
+            }
+            CaretMotion::Right | CaretMotion::WordNext => {
+                self.ensure_text_after(doc, c.block);
+                let m = if action == CaretMotion::Right { Motion::Right } else { Motion::NextWord };
+                let moved = doc.blocks[c.block]
+                    .buffer
+                    .cursor_motion(&mut self.font_system, c.cursor, None, m)
+                    .filter(|(nc, _)| *nc != c.cursor);
+                match moved {
+                    Some((nc, _)) => c.cursor = nc,
+                    None => {
+                        if let Some(nb) = next_text_block(&doc.blocks, c.block) {
+                            c.block = nb;
+                            c.cursor = Cursor::new(0, 0);
+                        }
+                    }
+                }
+                c.desired_x = None;
+            }
+            CaretMotion::Up | CaretMotion::Down => {
+                let down = action == CaretMotion::Down;
+                // Seed the desired column (page px) on the first vertical move.
+                if c.desired_x.is_none()
+                    && let Some((x, _)) = doc.blocks[c.block].buffer.cursor_position(&c.cursor)
+                {
+                    c.desired_x = Some(x + doc.blocks[c.block].indent as f32);
+                }
+                if down {
+                    self.ensure_text_after(doc, c.block);
+                }
+                let m = if down { Motion::Down } else { Motion::Up };
+                let moved = doc.blocks[c.block]
+                    .buffer
+                    .cursor_motion(&mut self.font_system, c.cursor, None, m)
+                    .filter(|(nc, _)| *nc != c.cursor);
+                match moved {
+                    Some((nc, _)) => c.cursor = nc,
+                    None => {
+                        let nb = if down {
+                            next_text_block(&doc.blocks, c.block)
+                        } else {
+                            prev_text_block(&doc.blocks, c.block)
+                        };
+                        if let Some(nb) = nb {
+                            let dx = (c.desired_x.unwrap_or(0.0)
+                                - doc.blocks[nb].indent as f32)
+                                .max(0.0);
+                            let by = if down {
+                                0.0
+                            } else {
+                                doc.blocks[nb].height.saturating_sub(1) as f32
+                            };
+                            if let Some(nc) = doc.blocks[nb].buffer.hit(dx, by) {
+                                c.block = nb;
+                                c.cursor = nc;
+                            }
+                        }
+                    }
+                }
+            }
+            CaretMotion::DocStart => {
+                if let Some(fb) = first_text_block(&doc.blocks) {
+                    c.block = fb;
+                    c.cursor = doc.blocks[fb]
+                        .buffer
+                        .cursor_motion(&mut self.font_system, Cursor::new(0, 0), None, Motion::BufferStart)
+                        .map(|(nc, _)| nc)
+                        .unwrap_or(Cursor::new(0, 0));
+                }
+                c.desired_x = None;
+            }
+            CaretMotion::DocEnd => {
+                self.ensure_fully_shaped(doc);
+                if let Some(lb) = last_text_block(&doc.blocks) {
+                    c.block = lb;
+                    c.cursor = block_end_cursor(&doc.blocks[lb].buffer);
+                }
+                c.desired_x = None;
+            }
+            CaretMotion::Show
+            | CaretMotion::VisualStart
+            | CaretMotion::Copy
+            | CaretMotion::Hide => {}
+        }
+        doc.caret = Some(c);
+    }
+
     /// Shape one top-level element, append its positioned blocks, and advance
     /// the running height. Updates `total_h` (exact when done, else estimate).
     fn shape_one(&mut self, doc: &mut RichDoc) {
@@ -573,12 +896,17 @@ impl Painter {
         let mut y = doc.shaped_h;
         for b in blocks {
             y += b.space_before;
+            // Navigable text = a non-empty buffer with real height. Markers
+            // (height 0) and table/chart/image/rule placeholders (empty buffer)
+            // are skipped by the caret.
+            let text = b.height > 0 && buffer_has_text(&b.buffer);
             doc.blocks.push(Placed {
                 buffer: b.buffer,
                 y_top: y,
                 height: b.height,
                 indent: b.indent,
                 decorations: b.decorations,
+                text,
             });
             y += b.height;
         }
@@ -1143,6 +1471,14 @@ impl Painter {
             .fold(0.0_f32, f32::max)
     }
 
+    /// Width of the widest whitespace-delimited token in `text` — a column's
+    /// minimum content width, below which words are forced to break mid-word.
+    fn widest_word(&mut self, text: &str, bold: bool, st: &DocStyle, size: f32) -> f32 {
+        text.split_whitespace()
+            .map(|w| self.measure_width(w, bold, st, size))
+            .fold(0.0_f32, f32::max)
+    }
+
     /// Rasterize a shaped buffer onto `img` at (ox, oy), alpha-blending glyphs.
     fn blit_buffer(&mut self, img: &mut RgbaImage, buffer: &mut Buffer, ox: i32, oy: i32, ink: Color) {
         let (iw, ih) = (img.width(), img.height());
@@ -1193,31 +1529,77 @@ impl Painter {
             row.get(c).cloned().unwrap_or_default()
         };
 
-        // 1. Natural column widths from measured single-line content.
+        // 1. Per-column width bounds:
+        //    - `natural` (max-content): widest single-line cell — what the column
+        //      wants if space were free.
+        //    - `min_content`: the widest single *word*, below which text would be
+        //      forced to break mid-word. A column must never go below this.
+        let slack = pad_x * 2.0 + fs * 0.3;
         let mut natural = vec![0.0_f32; ncol];
-        for (c, nat) in natural.iter_mut().enumerate() {
-            let mut w = self.measure_width(&cell(headers, c), true, st, fs);
+        let mut min_content = vec![0.0_f32; ncol];
+        for c in 0..ncol {
+            let mut nat = self.measure_width(&cell(headers, c), true, st, fs);
+            let mut minw = self.widest_word(&cell(headers, c), true, st, fs);
             for row in rows {
-                w = w.max(self.measure_width(&cell(row, c), false, st, fs));
+                nat = nat.max(self.measure_width(&cell(row, c), false, st, fs));
+                minw = minw.max(self.widest_word(&cell(row, c), false, st, fs));
             }
-            // Small slack so a cell that measured to fit doesn't wrap on a
-            // sub-pixel rounding boundary during the final shaping pass.
-            *nat = w + pad_x * 2.0 + fs * 0.3;
+            natural[c] = nat + slack;
+            min_content[c] = (minw + slack).min(natural[c]);
         }
         let total_natural: f32 = natural.iter().sum();
-
-        // 2. Keep natural widths if they fit the measure; else scale down to fit
-        //    (cells then wrap) with a per-column minimum.
         let avail = width as f32;
+
+        // 2. Allocate width.
         let col_w: Vec<u32> = if total_natural <= avail {
+            // Everything fits on one line per cell — use natural widths.
             natural.iter().map(|w| (w.round() as u32).max(1)).collect()
         } else {
-            let factor = avail / total_natural;
-            let min_w = (fs * 3.0).round();
-            natural
-                .iter()
-                .map(|w| ((w * factor).max(min_w).round() as u32).max(1))
-                .collect()
+            let total_min: f32 = min_content.iter().sum();
+            if total_min < avail {
+                // Give every column its widest word, then hand the remaining
+                // width out in proportion to how much *more* each column wants
+                // (natural − min). A long prose column has by far the largest
+                // demand, so it absorbs the slack and wraps, while short label
+                // columns keep enough room to never break a word.
+                let surplus = avail - total_min;
+                let total_desire: f32 = natural
+                    .iter()
+                    .zip(&min_content)
+                    .map(|(n, m)| (n - m).max(0.0))
+                    .sum();
+                if total_desire <= f32::EPSILON {
+                    min_content.iter().map(|m| (m.round() as u32).max(1)).collect()
+                } else {
+                    natural
+                        .iter()
+                        .zip(&min_content)
+                        .map(|(n, m)| {
+                            let desire = (n - m).max(0.0);
+                            ((m + surplus * (desire / total_desire)).round() as u32).max(1)
+                        })
+                        .collect()
+                }
+            } else {
+                // Even one word per column won't fit (very wide / many columns).
+                // Max-min fair share: satisfy the narrow columns fully and split
+                // the leftover equally among the wide ones, so only the columns
+                // that truly can't fit are squeezed (rather than crushing all of
+                // them uniformly). Some mid-word breaking is unavoidable here.
+                let mut order: Vec<usize> = (0..ncol).collect();
+                order.sort_by(|&a, &b| min_content[a].total_cmp(&min_content[b]));
+                let mut out = vec![1u32; ncol];
+                let mut remaining = avail;
+                let mut left = ncol as f32;
+                for &i in &order {
+                    let fair = remaining / left;
+                    let w = min_content[i].min(fair);
+                    out[i] = (w.round() as u32).max(1);
+                    remaining -= w;
+                    left -= 1.0;
+                }
+                out
+            }
         };
         let table_w: u32 = col_w.iter().sum();
         if table_w == 0 {
@@ -1456,6 +1838,22 @@ fn fill_rect(img: &mut RgbaImage, x: i32, y: i32, w: u32, h: u32, color: Rgb) {
 }
 
 #[cfg(test)]
+impl RichDoc {
+    fn caret_block(&self) -> Option<usize> {
+        self.caret.as_ref().map(|c| c.block)
+    }
+    fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+    fn block_is_text(&self, i: usize) -> bool {
+        self.blocks.get(i).is_some_and(|b| b.text)
+    }
+    fn has_anchor(&self) -> bool {
+        self.caret.as_ref().is_some_and(|c| c.anchor.is_some())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
@@ -1621,5 +2019,110 @@ mod tests {
             c2.len() as f64 / 1e6,
             rgb_raw.len() as f64 / 1e6,
         );
+    }
+
+    // ── Keyboard caret ──────────────────────────────────────────────────────
+
+    /// A document with a table sandwiched between text, to exercise non-text
+    /// skipping and cross-block motion.
+    fn caret_doc() -> (Painter, RichDoc) {
+        let md = "# Title\n\nFirst paragraph of prose with several words to walk through.\n\n\
+                  | A | B |\n|---|---|\n| 1 | 2 |\n\n\
+                  Second paragraph after the table, also with some words.\n\n\
+                  ```\nfn x() {}\n```\n\nFinal closing paragraph here.\n";
+        let style = DocStyle::light();
+        let (mut painter, mut doc) = crate::rich::lay_out_document(md, &style, None);
+        painter.ensure_fully_shaped(&mut doc);
+        (painter, doc)
+    }
+
+    /// Every block the caret rests on must be a text block, and downward motion
+    /// must step over the (non-text) table block.
+    #[test]
+    fn caret_skips_non_text_blocks() {
+        let (mut painter, mut doc) = caret_doc();
+        // There must be at least one non-text block (the table) to make the test
+        // meaningful.
+        assert!(
+            (0..doc.block_count()).any(|i| !doc.block_is_text(i)),
+            "fixture should contain a non-text (table/code-deco) block"
+        );
+
+        painter.caret_apply(&mut doc, CaretMotion::Down, 0);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..60 {
+            let b = doc.caret_block().expect("caret present after motion");
+            assert!(doc.block_is_text(b), "caret landed on a non-text block {b}");
+            seen.insert(b);
+            painter.caret_apply(&mut doc, CaretMotion::Down, 0);
+        }
+        // It should have visited more than one block (crossed boundaries).
+        assert!(seen.len() > 1, "caret never crossed a block boundary");
+    }
+
+    #[test]
+    fn caret_g_and_capital_g_land_on_first_and_last_text() {
+        let (mut painter, mut doc) = caret_doc();
+        painter.caret_apply(&mut doc, CaretMotion::DocEnd, 0);
+        assert_eq!(doc.caret_block(), last_text_block(&doc.blocks));
+        painter.caret_apply(&mut doc, CaretMotion::DocStart, 0);
+        assert_eq!(doc.caret_block(), first_text_block(&doc.blocks));
+    }
+
+    #[test]
+    fn visual_mode_copies_text_but_not_table() {
+        let (mut painter, mut doc) = caret_doc();
+        // Anchor at the top, select to the end of the document.
+        painter.caret_apply(&mut doc, CaretMotion::DocStart, 0);
+        painter.caret_apply(&mut doc, CaretMotion::VisualStart, 0);
+        assert!(doc.has_anchor());
+        painter.caret_apply(&mut doc, CaretMotion::DocEnd, 0);
+        let render = painter.caret_apply(&mut doc, CaretMotion::Copy, 0);
+        let text = render.copy_text.expect("copy yields text");
+        assert!(text.contains("First paragraph"), "text: {text:?}");
+        assert!(text.contains("Final closing paragraph"), "text: {text:?}");
+        // Table cell contents live in a bitmap decoration, not a text buffer, so
+        // they are never part of a copy.
+        assert!(!text.contains("| A |"), "table markup leaked into copy");
+    }
+
+    #[test]
+    fn copy_without_selection_is_none() {
+        let (mut painter, mut doc) = caret_doc();
+        painter.caret_apply(&mut doc, CaretMotion::Down, 0);
+        let render = painter.caret_apply(&mut doc, CaretMotion::Copy, 0);
+        assert!(render.copy_text.is_none(), "no anchor ⇒ no copy text");
+    }
+
+    #[test]
+    fn hide_clears_the_caret() {
+        let (mut painter, mut doc) = caret_doc();
+        painter.caret_apply(&mut doc, CaretMotion::Down, 0);
+        assert!(doc.caret_block().is_some());
+        let render = painter.caret_apply(&mut doc, CaretMotion::Hide, 0);
+        assert!(render.caret.is_none());
+        assert!(doc.caret_block().is_none());
+    }
+
+    #[test]
+    fn show_enters_cursor_without_selection() {
+        let (mut painter, mut doc) = caret_doc();
+        let render = painter.caret_apply(&mut doc, CaretMotion::Show, 0);
+        assert!(render.caret.is_some(), "Show makes the caret visible");
+        assert!(!doc.has_anchor(), "Show does not start a selection");
+        assert!(render.rects.is_empty());
+    }
+
+    #[test]
+    fn copy_exits_cursor_mode() {
+        let (mut painter, mut doc) = caret_doc();
+        painter.caret_apply(&mut doc, CaretMotion::Show, 0);
+        painter.caret_apply(&mut doc, CaretMotion::VisualStart, 0);
+        painter.caret_apply(&mut doc, CaretMotion::Down, 0);
+        let render = painter.caret_apply(&mut doc, CaretMotion::Copy, 0);
+        // Copy yields the text and then leaves cursor mode (caret hidden).
+        assert!(render.copy_text.is_some());
+        assert!(render.caret.is_none());
+        assert!(doc.caret_block().is_none());
     }
 }

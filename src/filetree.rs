@@ -34,7 +34,29 @@ pub struct VisibleRow {
     pub expanded: bool,
     pub name: String,
     pub path: PathBuf,
+    /// A short, dimmed locator shown after the name. `None` for tree rows; for
+    /// search results it holds the parent dir (relative to root) plus a match
+    /// count, e.g. `guide/advanced · 3`. Pre-truncated at construction.
+    pub detail: Option<String>,
 }
+
+/// Outcome of running a search: how many files matched and whether the scan was
+/// capped before reaching the end of the tree.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOutcome {
+    /// Number of files matched. Read in tests; the UI uses the live row count.
+    #[allow(dead_code)]
+    pub matched: usize,
+    pub truncated: bool,
+}
+
+/// Stop scanning after this many files (keeps a synchronous search on the UI
+/// thread bounded even in a large, un-pruned tree).
+const MAX_SEARCH_FILES: usize = 2000;
+/// Skip files larger than this when grepping contents (filename can still match).
+const MAX_SEARCH_FILE_BYTES: u64 = 1_000_000;
+/// Cap on the dimmed locator length so a deep path can't blow up the row width.
+const MAX_DETAIL_LEN: usize = 40;
 
 /// The browsable tree plus selection and scroll state.
 pub struct FileTree {
@@ -42,6 +64,9 @@ pub struct FileTree {
     expanded: HashSet<PathBuf>,
     selected: usize,
     visible: Vec<VisibleRow>,
+    /// When `Some`, the sidebar shows these ranked search results instead of the
+    /// tree. `selected`/`scroll` index into whichever list `visible()` returns.
+    search: Option<Vec<VisibleRow>>,
     /// Index of the first visible row currently shown (for list scrolling).
     scroll: usize,
 }
@@ -134,27 +159,16 @@ impl FileTree {
             expanded: HashSet::new(),
             selected: 0,
             visible: Vec::new(),
+            search: None,
             scroll: 0,
         };
 
-        // Expand the ancestor chain of the focus file so it's revealed. `focus`
-        // and `root_dir` come from the same CLI argument, so they share a path
-        // space — no canonicalization needed (and mixing canonical focus paths
-        // with as-read tree paths would silently fail to match).
+        // Expand the ancestor chain of the focus file so it's revealed, then
+        // select it.
         if let Some(focus) = focus {
-            let mut cur = focus.parent();
-            while let Some(dir) = cur {
-                tree.expanded.insert(dir.to_path_buf());
-                if dir == tree.root.path {
-                    break;
-                }
-                cur = dir.parent();
-            }
+            tree.expand_to(focus);
         }
-
         tree.rebuild_visible();
-
-        // Select the focus row if we can match it; else the first row.
         if let Some(focus) = focus
             && let Some(idx) = tree.visible.iter().position(|r| r.path == focus)
         {
@@ -163,15 +177,35 @@ impl FileTree {
         Ok(tree)
     }
 
-    /// Whether the tree has no rows at all.
+    /// Expand the ancestor directory chain of `path` so a `rebuild_visible` will
+    /// reveal it. `path` and the tree share a path space (both derived from the
+    /// same CLI argument), so no canonicalization is needed.
+    fn expand_to(&mut self, path: &Path) {
+        let mut cur = path.parent();
+        while let Some(dir) = cur {
+            self.expanded.insert(dir.to_path_buf());
+            if dir == self.root.path {
+                break;
+            }
+            cur = dir.parent();
+        }
+    }
+
+    /// Whether the tree has no rows at all (browse mode).
     pub fn is_empty(&self) -> bool {
         self.visible.is_empty()
     }
 
-    /// The visible rows currently on screen (full list; the caller windows it
-    /// with [`scroll`](Self::scroll) and [`ensure_visible`](Self::ensure_visible)).
+    /// Whether a search is currently active (results are shown instead of the tree).
+    pub fn is_searching(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// The visible rows currently on screen — search results when a search is
+    /// active, else the tree's flattened rows. The caller windows it with
+    /// [`scroll`](Self::scroll) and [`ensure_visible`](Self::ensure_visible).
     pub fn visible(&self) -> &[VisibleRow] {
-        &self.visible
+        self.search.as_deref().unwrap_or(&self.visible)
     }
 
     pub fn selected(&self) -> usize {
@@ -185,7 +219,7 @@ impl FileTree {
     /// Path of the currently selected row, if any.
     #[allow(dead_code)] // exercised by tests; part of the tree's public surface
     pub fn selected_path(&self) -> Option<&Path> {
-        self.visible.get(self.selected).map(|r| r.path.as_path())
+        self.visible().get(self.selected).map(|r| r.path.as_path())
     }
 
     /// Path of the first markdown *file* in display order — used to pick what to
@@ -208,8 +242,9 @@ impl FileTree {
 
     /// Move the selection down/up by one visible row (saturating at the ends).
     pub fn select_next(&mut self) {
-        if !self.visible.is_empty() {
-            self.selected = (self.selected + 1).min(self.visible.len() - 1);
+        let n = self.visible().len();
+        if n > 0 {
+            self.selected = (self.selected + 1).min(n - 1);
         }
     }
 
@@ -219,8 +254,9 @@ impl FileTree {
 
     /// Select a specific visible-row index (clamped). Used for mouse clicks.
     pub fn select_index(&mut self, idx: usize) {
-        if !self.visible.is_empty() {
-            self.selected = idx.min(self.visible.len() - 1);
+        let n = self.visible().len();
+        if n > 0 {
+            self.selected = idx.min(n - 1);
         }
     }
 
@@ -228,12 +264,18 @@ impl FileTree {
     /// to a visible-row index, if one exists there.
     pub fn row_at(&self, view_row: usize) -> Option<usize> {
         let idx = self.scroll + view_row;
-        (idx < self.visible.len()).then_some(idx)
+        (idx < self.visible().len()).then_some(idx)
     }
 
     /// Activate the selected row. A directory toggles expand/collapse and
     /// returns `None`; a file returns its path for the caller to open.
     pub fn activate(&mut self) -> Option<PathBuf> {
+        // Search results are always files — return the path directly, never the
+        // tree's expand/collapse path (which would `rebuild_visible` and wipe
+        // the results).
+        if self.search.is_some() {
+            return self.visible().get(self.selected).map(|r| r.path.clone());
+        }
         let row = self.visible.get(self.selected)?;
         if row.is_dir {
             let path = row.path.clone();
@@ -284,12 +326,213 @@ impl FileTree {
                 expanded: is_expanded,
                 name: child.name.clone(),
                 path: child.path.clone(),
+                detail: None,
             });
             if is_expanded {
                 Self::flatten(child, depth + 1, expanded, out);
             }
         }
     }
+
+    /// Collect every file path in the tree, depth-first in display order.
+    fn collect_files(node: &Node, out: &mut Vec<PathBuf>) {
+        for child in &node.children {
+            if child.is_dir {
+                Self::collect_files(child, out);
+            } else {
+                out.push(child.path.clone());
+            }
+        }
+    }
+
+    /// Run a combined filename (fuzzy) + content (grep) search over the tree and
+    /// switch the sidebar to a ranked flat result list. Case-insensitive (ASCII
+    /// fold; non-ASCII isn't case-folded — acceptable for v1). Synchronous and
+    /// bounded by `MAX_SEARCH_FILES` / `MAX_SEARCH_FILE_BYTES`.
+    pub fn set_search(&mut self, query: &str) -> SearchOutcome {
+        let q = query.trim().to_ascii_lowercase();
+        self.selected = 0;
+        self.scroll = 0;
+        if q.is_empty() {
+            self.search = Some(Vec::new());
+            return SearchOutcome { matched: 0, truncated: false };
+        }
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        Self::collect_files(&self.root, &mut files);
+        let truncated = files.len() > MAX_SEARCH_FILES;
+        files.truncate(MAX_SEARCH_FILES);
+
+        let root = self.root.path.clone();
+        struct Hit {
+            row: VisibleRow,
+            name_score: Option<i32>,
+            count: usize,
+        }
+        let mut hits: Vec<Hit> = Vec::new();
+        for path in files {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            let name_score = fuzzy_score(&q, &rel);
+            let count = count_in_file(&path, &q);
+            if name_score.is_none() && count == 0 {
+                continue;
+            }
+
+            // Dimmed locator: parent dir (relative to root) + match count.
+            let mut detail = path
+                .parent()
+                .and_then(|p| p.strip_prefix(&root).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default();
+            if count > 0 {
+                if !detail.is_empty() {
+                    detail.push_str(" · ");
+                }
+                detail.push_str(&format!("{count} match{}", if count == 1 { "" } else { "es" }));
+            }
+            let detail = (!detail.is_empty()).then(|| truncate_str(&detail, MAX_DETAIL_LEN));
+
+            hits.push(Hit {
+                row: VisibleRow {
+                    depth: 0,
+                    is_dir: false,
+                    expanded: false,
+                    name,
+                    path,
+                    detail,
+                },
+                name_score,
+                count,
+            });
+        }
+
+        // Filename hits (by fuzzy score desc) rank above content-only hits (by
+        // match count desc); tie-break alphabetically.
+        hits.sort_by(|a, b| {
+            b.name_score
+                .is_some()
+                .cmp(&a.name_score.is_some())
+                .then_with(|| {
+                    b.name_score
+                        .unwrap_or(i32::MIN)
+                        .cmp(&a.name_score.unwrap_or(i32::MIN))
+                })
+                .then_with(|| b.count.cmp(&a.count))
+                .then_with(|| {
+                    a.row.name.to_ascii_lowercase().cmp(&b.row.name.to_ascii_lowercase())
+                })
+        });
+
+        let rows: Vec<VisibleRow> = hits.into_iter().map(|h| h.row).collect();
+        let matched = rows.len();
+        self.search = Some(rows);
+        SearchOutcome { matched, truncated }
+    }
+
+    /// Leave search mode and restore the tree. If `reveal` is given, its ancestor
+    /// directories are expanded and it is selected (so an opened result stays
+    /// visible); otherwise selection resets to the top.
+    pub fn clear_search(&mut self, reveal: Option<&Path>) {
+        self.search = None;
+        if let Some(path) = reveal {
+            self.expand_to(path);
+        }
+        self.rebuild_visible();
+        self.selected = reveal
+            .and_then(|p| self.visible.iter().position(|r| r.path == p))
+            .unwrap_or(0);
+        self.scroll = 0;
+    }
+}
+
+/// Fuzzy-subsequence score of `query` within `hay` (both already lowercased).
+/// `None` if `query` is not a subsequence of `hay`. Higher is better: contiguous
+/// runs and matches right after a separator/word boundary score more; longer
+/// haystacks are lightly penalized so shorter paths win ties.
+fn fuzzy_score(query: &str, hay: &str) -> Option<i32> {
+    if query.is_empty() {
+        return None;
+    }
+    let mut q = query.chars().peekable();
+    let qlen = query.chars().count();
+    let mut score = 0i32;
+    let mut matched = 0usize;
+    let mut prev_matched = false;
+    let mut prev: Option<char> = None;
+    for c in hay.chars() {
+        match q.peek() {
+            Some(&want) if c == want => {
+                score += 1;
+                if prev_matched {
+                    score += 3;
+                }
+                if prev.is_none_or(|p| matches!(p, '/' | '\\' | '_' | '-' | ' ' | '.')) {
+                    score += 2;
+                }
+                matched += 1;
+                prev_matched = true;
+                q.next();
+            }
+            Some(_) => prev_matched = false,
+            None => break,
+        }
+        prev = Some(c);
+    }
+    (matched == qlen).then_some(score - (hay.chars().count() as i32) / 16)
+}
+
+/// Count case-insensitive occurrences of `needle` (already lowercased) in the
+/// file's contents. Returns 0 for unreadable, oversized, or non-matching files.
+fn count_in_file(path: &Path, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_SEARCH_FILE_BYTES) {
+        return 0;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return 0;
+    };
+    let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+    count_substring(&text, needle)
+}
+
+/// Count non-overlapping occurrences of `needle` in `hay`.
+fn count_substring(hay: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(pos) = hay[start..].find(needle) {
+        count += 1;
+        start += pos + needle.len();
+    }
+    count
+}
+
+/// Truncate to at most `max` chars (appending `…` if cut), replacing control
+/// characters with spaces so a detail stays single-line.
+fn truncate_str(s: &str, max: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() <= max {
+        return cleaned;
+    }
+    let mut out: String = cleaned.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -425,6 +668,83 @@ mod tests {
         tree.ensure_visible(5);
         assert!(tree.selected() >= tree.scroll());
         assert!(tree.selected() < tree.scroll() + 5);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_score_subsequence_and_ranking() {
+        // Non-subsequence → None.
+        assert!(fuzzy_score("xyz", "guide/api.md").is_none());
+        // Subsequence → Some.
+        assert!(fuzzy_score("api", "guide/api.md").is_some());
+        // Contiguous + boundary match scores higher than scattered.
+        let contiguous = fuzzy_score("api", "api.md").unwrap();
+        let scattered = fuzzy_score("api", "a-p-i-x.md").unwrap();
+        assert!(contiguous > scattered, "{contiguous} !> {scattered}");
+    }
+
+    #[test]
+    fn count_substring_counts_occurrences() {
+        assert_eq!(count_substring("a tuning of tuning", "tuning"), 2);
+        assert_eq!(count_substring("nothing here", "xyz"), 0);
+        assert_eq!(count_substring("aaaa", "aa"), 2); // non-overlapping
+    }
+
+    #[test]
+    fn search_matches_filename_and_content() {
+        let root = temp_root("search");
+        fs::write(root.join("api.md"), b"# API\nendpoints\n").unwrap();
+        fs::create_dir_all(root.join("guide")).unwrap();
+        // No "api" in the name, but it appears in the body twice.
+        fs::write(root.join("guide/intro.md"), b"the api is great; api again\n").unwrap();
+        fs::write(root.join("unrelated.md"), b"nothing relevant here\n").unwrap();
+
+        let mut tree = FileTree::build(&root, None).unwrap();
+        let outcome = tree.set_search("api");
+        assert!(tree.is_searching());
+        assert_eq!(outcome.matched, 2, "api.md (name) + intro.md (content)");
+        let names: Vec<_> = tree.visible().iter().map(|r| r.name.as_str()).collect();
+        // Filename hit ranks above the content-only hit.
+        assert_eq!(names, vec!["api.md", "intro.md"], "got {names:?}");
+        // The content hit carries a match count in its detail.
+        let intro = &tree.visible()[1];
+        assert!(
+            intro.detail.as_deref().unwrap_or("").contains("2 matches"),
+            "detail: {:?}",
+            intro.detail
+        );
+        // Activating a result returns its path (never toggles a tree dir).
+        tree.select_index(1);
+        assert_eq!(tree.activate().as_deref(), Some(root.join("guide/intro.md").as_path()));
+
+        // Gibberish → no matches.
+        let none = tree.set_search("zzzqqq");
+        assert_eq!(none.matched, 0);
+        assert!(tree.visible().is_empty());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn clear_search_restores_tree_and_reveals_file() {
+        let root = temp_root("clear-search");
+        let deep = root.join("guide/advanced/tuning.md");
+        touch(&deep);
+        touch(&root.join("top.md"));
+
+        let mut tree = FileTree::build(&root, None).unwrap();
+        // The deep file is in a collapsed subtree initially.
+        assert!(!tree.visible().iter().any(|r| r.name == "tuning.md"));
+        tree.set_search("tuning");
+        assert!(tree.is_searching());
+
+        // Clearing with the deep file as the reveal target expands its ancestors
+        // and selects it.
+        tree.clear_search(Some(&deep));
+        assert!(!tree.is_searching());
+        assert_eq!(tree.selected_path(), Some(deep.as_path()));
+        assert!(tree.visible().iter().any(|r| r.name == "tuning.md"));
+
         fs::remove_dir_all(&root).ok();
     }
 }

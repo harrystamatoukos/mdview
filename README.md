@@ -10,7 +10,9 @@ whitespace, and clear typographic hierarchy — and ships two readers:
   anti-aliasing) and displays it inline through a terminal **graphics protocol**
   (kitty / iTerm2). It reads like a native app, not a grid of monospace cells.
   Point it at a directory (or run it with no argument) and it opens a **file-tree
-  sidebar** to browse and read every markdown file in the tree.
+  sidebar** to browse and read every markdown file in the tree — with `/` to
+  **search** across the tree (by name and contents) and a vim-style **keyboard
+  cursor** to select and copy text without the mouse.
 - **Classic text reader (`--tui`).** Styled terminal text that works in any terminal.
   Used automatically as a fallback when no graphics-capable terminal is detected.
 
@@ -57,27 +59,48 @@ The directory sidebar is part of the graphical reader; `--tui`, `--print`,
 
 ## Keyboard shortcuts
 
+**Reading**
+
 | Key | Action |
 |-----|--------|
-| `j` / `↓` | Scroll down |
-| `k` / `↑` | Scroll up |
-| `Space` / `PageDown` | Page down |
-| `b` / `PageUp` | Page up |
-| `d` / `u` | Half page down / up *(text reader)* |
-| `g` / `Home` | Go to top |
-| `G` / `End` | Go to bottom |
+| `j` `k` / `↑` `↓` | Scroll |
+| `Space` / `PageDown` / `PageUp` | Page down / up |
+| `g` / `G` (or `Home` / `End`) | Top / bottom |
 | Mouse wheel | Scroll |
+| `/` | Find files (by name **and** contents) |
+| `Tab` | Focus the file sidebar |
+| `v` | Start the keyboard cursor (select & copy) |
 | `q` / `Esc` | Quit |
 
-When the file sidebar is open (graphical reader), `Tab` switches focus between the
-sidebar and the page:
+**File sidebar** (`Tab` to focus)
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Toggle focus between the sidebar and the reader |
-| `↑` / `↓` | *(sidebar focused)* Move the selection |
-| `Enter` | *(sidebar focused)* Open a file, or expand/collapse a folder |
-| Click / wheel | Select or scroll within the sidebar |
+| `↑` / `↓` | Move the selection |
+| `Enter` | Open a file, or expand/collapse a folder |
+| Click / wheel | Select or scroll |
+
+**Find** (`/`)
+
+| Key | Action |
+|-----|--------|
+| *type* | Query matched against filenames (fuzzy) and file contents |
+| `Enter` | Run the search; results rank filename hits above content hits |
+| `↑` / `↓`, `Enter` | Move through results and open one |
+| `Esc` | Clear and return to the tree |
+
+**Cursor & selection** — press `v` in the reader to drop a keyboard cursor
+
+| Key | Action |
+|-----|--------|
+| `←→↑↓` / `h` `j` `k` `l` | Move the cursor (the page follows) |
+| `w` / `b` | Move / extend by word |
+| `v` | Start / stop selecting |
+| `y` / `Enter` | Copy the selection |
+| `Esc` | Exit the cursor (back to scrolling) |
+
+The classic `--tui` reader uses the same scroll keys plus `d` / `u` for half-page
+scrolling.
 
 ## Requirements
 
