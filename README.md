@@ -9,6 +9,8 @@ whitespace, and clear typographic hierarchy — and ships two readers:
   (via [cosmic-text](https://github.com/pop-os/cosmic-text) — shaping, kerning,
   anti-aliasing) and displays it inline through a terminal **graphics protocol**
   (kitty / iTerm2). It reads like a native app, not a grid of monospace cells.
+  Point it at a directory (or run it with no argument) and it opens a **file-tree
+  sidebar** to browse and read every markdown file in the tree.
 - **Classic text reader (`--tui`).** Styled terminal text that works in any terminal.
   Used automatically as a fallback when no graphics-capable terminal is detected.
 
@@ -38,8 +40,10 @@ cargo build --release --no-default-features
 ## Usage
 
 ```bash
-mdview document.md            # graphical reader (default)
-mdview --tui document.md      # classic text reader
+mdview                        # browse the current directory (file-tree sidebar)
+mdview ./docs                 # browse a directory
+mdview document.md            # open a file (sidebar lists its siblings)
+mdview --tui document.md      # classic text reader (single file)
 mdview --print document.md    # render to stdout (for piping)
 mdview --watch document.md    # auto-refresh on file changes (text reader)
 mdview --theme dark document.md   # text reader theme: paper | dark | light
@@ -47,6 +51,9 @@ mdview --theme dark document.md   # text reader theme: paper | dark | light
 # Preview the graphical typography as a PNG (no graphics terminal required)
 mdview --export-png out.png document.md
 ```
+
+The directory sidebar is part of the graphical reader; `--tui`, `--print`,
+`--watch`, and `--export-png` operate on a single file.
 
 ## Keyboard shortcuts
 
@@ -61,6 +68,16 @@ mdview --export-png out.png document.md
 | `G` / `End` | Go to bottom |
 | Mouse wheel | Scroll |
 | `q` / `Esc` | Quit |
+
+When the file sidebar is open (graphical reader), `Tab` switches focus between the
+sidebar and the page:
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Toggle focus between the sidebar and the reader |
+| `↑` / `↓` | *(sidebar focused)* Move the selection |
+| `Enter` | *(sidebar focused)* Open a file, or expand/collapse a folder |
+| Click / wheel | Select or scroll within the sidebar |
 
 ## Requirements
 

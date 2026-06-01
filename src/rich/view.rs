@@ -37,7 +37,8 @@ use image::DynamicImage;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Rect, Size},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Paragraph},
     Terminal,
 };
@@ -45,8 +46,10 @@ use ratatui_image::{
     picker::Picker,
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
+use std::path::{Path, PathBuf};
 
 use super::{DocStyle, Painter, RichDoc};
+use crate::filetree::FileTree;
 
 /// A point in page device pixels.
 type PxPoint = (f32, f32);
@@ -74,6 +77,11 @@ const SHAPE_CHUNK: usize = 64;
 const PRODUCED_CAP: usize = 3;
 /// Decoded bands the UI keeps around (LRU by arrival). ≥ current + 2 neighbors.
 const CACHE_CAP: usize = 6;
+/// Default sidebar width in cells (capped to a third of the terminal).
+const SIDEBAR_W: u16 = 32;
+/// Minimum page columns to keep the reader usable. If the sidebar would leave
+/// fewer than this, it yields for that frame (page reclaims the full width).
+const MIN_CONTENT_CELLS: u16 = 24;
 
 enum RichEvent {
     Quit,
@@ -107,12 +115,37 @@ fn perf_log(msg: &str) {
     }
 }
 
-/// Launch the rich reader for the given markdown source.
-pub fn run(markdown: &str, base_dir: Option<std::path::PathBuf>) -> Result<()> {
+/// Launch the rich reader, browsing the markdown files under `root` with a
+/// sidebar. `focus`, when given, is the file to open first (and reveal/select in
+/// the tree); otherwise the first file in display order is opened.
+pub fn run(root: &Path, focus: Option<&Path>) -> Result<()> {
     if perf_enabled() {
         let _ = std::fs::write(perf_path(), b"=== mdview perf ===\n");
         eprintln!("[mdview] perf logging to {}", perf_path().display());
     }
+
+    // Build the tree. If no explicit focus, fall back to the first file so the
+    // sidebar opens with something selected and revealed.
+    let initial = match focus {
+        Some(f) => Some(f.to_path_buf()),
+        None => FileTree::build(root, None).ok().and_then(|t| t.first_file()),
+    };
+    let mut tree = FileTree::build(root, initial.as_deref())?;
+
+    let (markdown, base_dir) = match initial.as_deref() {
+        Some(path) => (
+            std::fs::read_to_string(path).unwrap_or_default(),
+            path.parent().map(|p| p.to_path_buf()),
+        ),
+        // No markdown anywhere under root: open an empty reader alongside the
+        // (empty) sidebar rather than erroring.
+        None => (String::new(), Some(root.to_path_buf())),
+    };
+    let title = initial
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
     enable_raw_mode()?;
 
@@ -130,7 +163,7 @@ pub fn run(markdown: &str, base_dir: Option<std::path::PathBuf>) -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &picker, markdown, base_dir);
+    let result = run_loop(&mut terminal, &picker, &markdown, base_dir, &mut tree, title);
 
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
@@ -147,6 +180,11 @@ pub fn run(markdown: &str, base_dir: Option<std::path::PathBuf>) -> Result<()> {
 /// always works toward the latest one. All fields are `Copy`/cheap.
 #[derive(Clone, Copy, PartialEq)]
 struct Target {
+    /// Document generation this target belongs to. Bumped on every file switch
+    /// so a band rendered for a previous document can be discarded — the
+    /// width-fit scale is identical across a switch, so `scale_bits` alone can't
+    /// tell an in-flight old-doc band apart from a current one.
+    epoch: u64,
     /// Band top, in document cell-rows at `scale` (an aligned slot).
     row0: u32,
     /// Band height in cell-rows (stable; independent of document length).
@@ -170,12 +208,20 @@ enum Request {
         anchor: (f32, f32),
         head: (f32, f32),
     },
+    /// Switch to a different document, reusing the worker's `Painter`/`FontSystem`.
+    /// `epoch` becomes the worker's current generation; responses are stamped with it.
+    Load {
+        epoch: u64,
+        markdown: String,
+        base_dir: Option<PathBuf>,
+    },
     Quit,
 }
 
 enum Response {
     /// A finished, encoded band ready to display.
     Band {
+        epoch: u64,
         row0: u32,
         rows: u32,
         cols: u16,
@@ -186,10 +232,11 @@ enum Response {
     },
     /// Background-shaping progress: the document's height estimate grew (or
     /// became exact). Lets the UI refine its scroll bounds.
-    Progress { total_h: u32, fully_shaped: bool },
+    Progress { epoch: u64, total_h: u32, fully_shaped: bool },
     /// Resolved selection: highlight rects (page device px) + text to copy.
     /// `id` echoes the request so the UI can ignore stale drag results.
     Selection {
+        epoch: u64,
         id: u64,
         rects: Vec<(f32, f32, f32, f32)>,
         text: String,
@@ -273,6 +320,20 @@ fn cell_to_page_px(
 // Render worker
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Re-parse `markdown` and lay it out on the *existing* `Painter`, reusing its
+/// `FontSystem` (the expensive resource). Used to switch documents without
+/// respawning the worker. The returned `RichDoc` replaces the previous one.
+fn reload_doc(
+    painter: &mut Painter,
+    style: &DocStyle,
+    markdown: &str,
+    base_dir: Option<PathBuf>,
+) -> RichDoc {
+    let elements = crate::parser::parse(markdown);
+    painter.set_base_dir(base_dir);
+    painter.begin(elements, style)
+}
+
 /// Owns the `Painter` (and `FontSystem`) and `RichDoc`. Serves the UI's latest
 /// target band first, then prefetches neighbors, then trickle-shapes the rest
 /// in the background, then blocks until the next request.
@@ -303,6 +364,9 @@ fn render_worker(
     ));
 
     let mut target: Option<Target> = None;
+    // Current document generation. Bumped (by the UI, echoed here) on every file
+    // switch; stamped into every response so the UI can drop old-doc bands.
+    let mut epoch: u64 = 0;
     // Recency-ordered keys of bands already produced (front = oldest).
     let mut produced: Vec<(u32, u32)> = Vec::with_capacity(PRODUCED_CAP);
 
@@ -318,6 +382,15 @@ fn render_worker(
                 Ok(Request::Select { id, anchor, head }) => {
                     pending_select = Some((id, anchor, head));
                 }
+                Ok(Request::Load { epoch: g, markdown, base_dir }) => {
+                    // Switch documents: re-lay out on the existing painter, then
+                    // forget everything tied to the old doc.
+                    epoch = g;
+                    doc = reload_doc(&mut painter, &style, &markdown, base_dir);
+                    produced.clear();
+                    pending_select = None;
+                    target = None;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
@@ -329,7 +402,7 @@ fn render_worker(
                 Some(s) => (s.rects, s.text),
                 None => (Vec::new(), String::new()),
             };
-            let _ = resp_tx.send(Response::Selection { id, rects, text });
+            let _ = resp_tx.send(Response::Selection { epoch, id, rects, text });
             continue 'main;
         }
 
@@ -337,7 +410,7 @@ fn render_worker(
             // 2. Serve the target band first (highest priority).
             let key = (t.row0, t.scale_bits);
             if !produced.contains(&key) {
-                match render_band(&mut painter, &mut doc, &picker, &t, t.row0) {
+                match render_band(&mut painter, &mut doc, &picker, &t, t.row0, epoch) {
                     Some(resp) => {
                         let _ = resp_tx.send(resp);
                     }
@@ -345,6 +418,7 @@ fn render_worker(
                         // Target fell past the (now exact) document end; report
                         // height so the UI re-clamps and picks a valid target.
                         let _ = resp_tx.send(Response::Progress {
+                            epoch,
                             total_h: doc.total_h,
                             fully_shaped: doc.fully_shaped(),
                         });
@@ -358,7 +432,7 @@ fn render_worker(
             for nrow0 in neighbor_row0s(&t) {
                 let nkey = (nrow0, t.scale_bits);
                 if !produced.contains(&nkey) {
-                    if let Some(resp) = render_band(&mut painter, &mut doc, &picker, &t, nrow0) {
+                    if let Some(resp) = render_band(&mut painter, &mut doc, &picker, &t, nrow0, epoch) {
                         let _ = resp_tx.send(resp);
                     }
                     remember(&mut produced, nkey);
@@ -375,6 +449,7 @@ fn render_worker(
         if painter.is_core_only() && !produced.is_empty() {
             painter.ensure_full_fonts();
             let _ = resp_tx.send(Response::Progress {
+                epoch,
                 total_h: doc.total_h,
                 fully_shaped: doc.fully_shaped(),
             });
@@ -385,6 +460,7 @@ fn render_worker(
         if !doc.fully_shaped() {
             painter.shape_step(&mut doc, SHAPE_CHUNK);
             let _ = resp_tx.send(Response::Progress {
+                epoch,
                 total_h: doc.total_h,
                 fully_shaped: doc.fully_shaped(),
             });
@@ -396,6 +472,13 @@ fn render_worker(
             Ok(Request::SetTarget(t)) => target = Some(t),
             Ok(Request::Select { id, anchor, head }) => {
                 pending_select = Some((id, anchor, head));
+            }
+            Ok(Request::Load { epoch: g, markdown, base_dir }) => {
+                epoch = g;
+                doc = reload_doc(&mut painter, &style, &markdown, base_dir);
+                produced.clear();
+                pending_select = None;
+                target = None;
             }
             Ok(Request::Quit) | Err(_) => return,
         }
@@ -410,6 +493,7 @@ fn render_band(
     picker: &Picker,
     t: &Target,
     row0: u32,
+    epoch: u64,
 ) -> Option<Response> {
     let scale = f32::from_bits(t.scale_bits);
     let cell_h = t.cell_h as u64;
@@ -451,6 +535,7 @@ fn render_band(
     ));
 
     Some(Response::Band {
+        epoch,
         row0,
         rows,
         cols,
@@ -494,10 +579,11 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     picker: &Picker,
     markdown: &str,
-    base_dir: Option<std::path::PathBuf>,
+    base_dir: Option<PathBuf>,
+    tree: &mut FileTree,
+    title: String,
 ) -> Result<()> {
     let style = DocStyle::light();
-    let bg = Color::Rgb(style.bg.0, style.bg.1, style.bg.2);
     // page_w is deterministic from the style — no need to wait on the worker.
     let page_w = style.content_px + style.margin_px * 2;
 
@@ -516,7 +602,7 @@ fn run_loop(
     };
 
     let result = ui_loop(
-        terminal, bg, page_w, cell_w, cell_h, &req_tx, &resp_rx,
+        terminal, &style, page_w, cell_w, cell_h, &req_tx, &resp_rx, tree, title,
     );
 
     // Tell the worker to exit (best-effort) and let it wind down.
@@ -526,53 +612,67 @@ fn run_loop(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ui_loop(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    bg: Color,
-    page_w: u32,
-    cell_w: u32,
-    cell_h: u32,
-    req_tx: &Sender<Request>,
-    resp_rx: &Receiver<Response>,
-) -> Result<()> {
-    let mut scroll_rows: u32 = 0;
-    let mut doc_total_h: u32 = 0; // unknown until the worker reports
-    let mut fully_shaped = false;
-    let mut cache: Vec<CachedBand> = Vec::new();
-    let mut last_target: Option<Target> = None;
-    let mut frame: u64 = 0;
-    let mut dirty = true;
-    let mut selection = Selection::default();
-    let mut overlay = super::overlay::Overlay::default();
+/// Which pane currently receives keyboard navigation. Mouse is always routed by
+/// column, independent of this.
+#[derive(Clone, Copy, PartialEq)]
+enum Focus {
+    Reader,
+    Sidebar,
+}
 
-    loop {
-        let term = terminal.size()?;
-        let (term_w, term_h) = (term.width, term.height);
+/// The per-frame device-pixel geometry: the single source of truth for the
+/// width-fit scale, the page's horizontal placement, and band slotting. Every
+/// consumer (the band draw, `cell_to_page_px`, the selection overlay, and the
+/// worker `Target`) reads the *same* `x_off`/`s`, so the sidebar offset can
+/// never disagree across them.
+struct Layout {
+    /// Cells available to the page (terminal width minus the sidebar).
+    content_w: u16,
+    /// Viewport height in cells (terminal height minus the status row).
+    view_h: u16,
+    s: f32,
+    scale_bits: u32,
+    /// Page width in display pixels (`round(page_w · s)`).
+    sw: u32,
+    /// Page's left cell on screen — `sidebar_w` plus the centering slack within
+    /// the content area, never less than `sidebar_w` (so the band can't bleed
+    /// under the sidebar on a narrow terminal — it right-clips instead).
+    x_off: u16,
+    band_rows: u32,
+    stride: u32,
+    max_row0: u32,
+    max_scroll: u32,
+    target_row0: u32,
+}
+
+impl Layout {
+    #[allow(clippy::too_many_arguments)]
+    fn compute(
+        term_w: u16,
+        term_h: u16,
+        sidebar_w: u16,
+        page_w: u32,
+        cell_w: u32,
+        cell_h: u32,
+        doc_total_h: u32,
+        scroll_rows: u32,
+    ) -> Self {
         let view_h = term_h.saturating_sub(1).max(1); // reserve status row
-        if term_w == 0 {
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
+        let content_w = term_w.saturating_sub(sidebar_w).max(1);
 
         // Width-fit scale: largest (never magnified past full resolution) while
-        // the page fits the terminal width. Independent of document length.
-        let term_w_px = term_w as u32 * cell_w;
-        let s = (term_w_px as f32 / page_w as f32).clamp(MIN_SCALE, 1.0);
+        // the page fits the *content* width. Independent of document length.
+        let content_w_px = content_w as u32 * cell_w;
+        let s = (content_w_px as f32 / page_w as f32).clamp(MIN_SCALE, 1.0);
         let scale_bits = s.to_bits();
 
         // Document height as scrollable cell-rows at this scale (0 until known).
         let doc_rows = if doc_total_h > 0 {
-            ((doc_total_h as f32 * s).round() as u32)
-                .div_ceil(cell_h)
-                .max(1)
+            ((doc_total_h as f32 * s).round() as u32).div_ceil(cell_h).max(1)
         } else {
             view_h as u32
         };
         let max_scroll = doc_rows.saturating_sub(view_h as u32);
-        if scroll_rows > max_scroll {
-            scroll_rows = max_scroll;
-        }
 
         // Band geometry — stable (independent of document length) so a band's
         // identity doesn't change as the height estimate is refined.
@@ -582,28 +682,231 @@ fn ui_loop(
         // Adjacent bands overlap by at least a viewport, so any viewport fits
         // entirely inside exactly one slot.
         let stride = band_rows.saturating_sub(view_h as u32 + 2).max(1);
-        let band_index = scroll_rows / stride;
+        let band_index = scroll_rows.min(max_scroll) / stride;
         let target_row0 = (band_index * stride).min(max_row0);
 
+        let cols_disp = sw.div_ceil(cell_w).max(1) as u16;
+        let x_off = sidebar_w + content_w.saturating_sub(cols_disp) / 2;
+        let x_off = x_off.max(sidebar_w);
+
+        Self {
+            content_w,
+            view_h,
+            s,
+            scale_bits,
+            sw,
+            x_off,
+            band_rows,
+            stride,
+            max_row0,
+            max_scroll,
+            target_row0,
+        }
+    }
+}
+
+fn rgb(c: (u8, u8, u8)) -> Color {
+    Color::Rgb(c.0, c.1, c.2)
+}
+
+/// Switch the reader to a different file: read it, bump the document generation,
+/// tell the worker to load it, and reset all per-document UI state so no stale
+/// band, scroll position, or selection from the previous file survives. On a
+/// read error the document is left untouched and the error is shown in the title.
+#[allow(clippy::too_many_arguments)]
+fn switch_to(
+    path: &Path,
+    req_tx: &Sender<Request>,
+    doc_gen: &mut u64,
+    cache: &mut Vec<CachedBand>,
+    scroll_rows: &mut u32,
+    doc_total_h: &mut u32,
+    fully_shaped: &mut bool,
+    last_target: &mut Option<Target>,
+    selection: &mut Selection,
+    overlay: &mut super::overlay::Overlay,
+    title: &mut String,
+) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            *doc_gen += 1;
+            let base_dir = path.parent().map(|p| p.to_path_buf());
+            let _ = req_tx.send(Request::Load {
+                epoch: *doc_gen,
+                markdown: content,
+                base_dir,
+            });
+            cache.clear();
+            *scroll_rows = 0;
+            *doc_total_h = 0;
+            *fully_shaped = false;
+            *last_target = None;
+            // Invalidate any in-flight selection result for the old document.
+            selection.req_id += 1;
+            selection.clear();
+            overlay.hide(&mut stdout());
+            *title = name;
+        }
+        Err(e) => {
+            *title = format!("⚠ cannot open {name}: {e}");
+        }
+    }
+}
+
+/// Render the file-tree sidebar into `area`. Styled with the paper palette so it
+/// reads as part of the page; the selected row is tinted (brighter when the
+/// sidebar holds focus).
+fn draw_sidebar(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    tree: &FileTree,
+    style: &DocStyle,
+    focused: bool,
+) {
+    let bg = rgb(style.bg);
+    let ink = rgb(style.ink);
+    let dim = rgb(style.chrome);
+    let dir_fg = rgb(style.h[1]);
+    f.render_widget(Block::default().style(Style::default().bg(bg)), area);
+
+    let view_h = area.height as usize;
+    let rows = tree.visible();
+    let scroll = tree.scroll();
+    let selected = tree.selected();
+    let sel_bg = if focused {
+        Color::Rgb(210, 224, 242)
+    } else {
+        Color::Rgb(232, 232, 235)
+    };
+
+    let mut lines: Vec<Line> = Vec::with_capacity(view_h);
+    for i in 0..view_h {
+        let idx = scroll + i;
+        let Some(r) = rows.get(idx) else {
+            lines.push(Line::from(""));
+            continue;
+        };
+        let indent = "  ".repeat(r.depth as usize);
+        let glyph = if r.is_dir {
+            if r.expanded { "▾ " } else { "▸ " }
+        } else {
+            "  "
+        };
+        let name_style = if r.is_dir {
+            Style::default().fg(dir_fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(ink)
+        };
+        let mut line = Line::from(vec![
+            Span::raw(indent),
+            Span::styled(glyph, Style::default().fg(dim)),
+            Span::styled(r.name.clone(), name_style),
+        ]);
+        if idx == selected {
+            let mut st = Style::default().bg(sel_bg);
+            if focused {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            line = line.style(st);
+        }
+        lines.push(line);
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(bg).fg(ink)),
+        area,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ui_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    style: &DocStyle,
+    page_w: u32,
+    cell_w: u32,
+    cell_h: u32,
+    req_tx: &Sender<Request>,
+    resp_rx: &Receiver<Response>,
+    tree: &mut FileTree,
+    mut title: String,
+) -> Result<()> {
+    let bg = rgb(style.bg);
+    let mut scroll_rows: u32 = 0;
+    let mut doc_total_h: u32 = 0; // unknown until the worker reports
+    let mut fully_shaped = false;
+    let mut cache: Vec<CachedBand> = Vec::new();
+    let mut last_target: Option<Target> = None;
+    let mut frame: u64 = 0;
+    let mut dirty = true;
+    let mut selection = Selection::default();
+    let mut overlay = super::overlay::Overlay::default();
+    let mut doc_gen: u64 = 0;
+    let mut focus = Focus::Reader;
+    // Persistent sidebar whenever there are files to browse.
+    let sidebar_enabled = !tree.is_empty();
+
+    loop {
+        let term = terminal.size()?;
+        let (term_w, term_h) = (term.width, term.height);
+        if term_w == 0 {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+
+        // Sidebar width: fixed, capped to a third of the terminal, and dropped
+        // to 0 if it would leave too little room to read comfortably.
+        let sidebar_w = if sidebar_enabled {
+            let w = SIDEBAR_W.min(term_w / 3);
+            if term_w.saturating_sub(w) < MIN_CONTENT_CELLS { 0 } else { w }
+        } else {
+            0
+        };
+        // If the sidebar collapsed away, keystrokes belong to the reader.
+        if sidebar_w == 0 {
+            focus = Focus::Reader;
+        }
+
+        let layout = Layout::compute(
+            term_w, term_h, sidebar_w, page_w, cell_w, cell_h, doc_total_h, scroll_rows,
+        );
+        let view_h = layout.view_h;
+        let scale_bits = layout.scale_bits;
+        let s = layout.s;
+        let max_scroll = layout.max_scroll;
+        if scroll_rows > max_scroll {
+            scroll_rows = max_scroll;
+        }
+        tree.ensure_visible(view_h as usize);
+
         let target = Target {
-            row0: target_row0,
-            rows: band_rows,
+            epoch: doc_gen,
+            row0: layout.target_row0,
+            rows: layout.band_rows,
             scale_bits,
             cell_w,
             cell_h,
-            stride,
-            max_row0,
+            stride: layout.stride,
+            max_row0: layout.max_row0,
         };
 
-        // 1. Drain worker responses.
+        // 1. Drain worker responses, discarding anything from an old document
+        //    (epoch mismatch) so a late band can't flash stale content after a
+        //    file switch — the fit-scale is identical across a switch, so
+        //    `scale_bits` alone wouldn't catch it.
         loop {
             match resp_rx.try_recv() {
-                Ok(Response::Progress { total_h, fully_shaped: fs }) => {
-                    doc_total_h = total_h;
-                    fully_shaped = fs;
-                    dirty = true;
+                Ok(Response::Progress { epoch, total_h, fully_shaped: fs }) => {
+                    if epoch == doc_gen {
+                        doc_total_h = total_h;
+                        fully_shaped = fs;
+                        dirty = true;
+                    }
                 }
                 Ok(Response::Band {
+                    epoch,
                     row0,
                     rows,
                     cols,
@@ -612,18 +915,20 @@ fn ui_loop(
                     total_h,
                     fully_shaped: fs,
                 }) => {
-                    doc_total_h = total_h;
-                    fully_shaped = fs;
-                    insert_band(
-                        &mut cache,
-                        CachedBand { proto, row0, rows, cols, scale_bits },
-                    );
-                    dirty = true;
+                    if epoch == doc_gen {
+                        doc_total_h = total_h;
+                        fully_shaped = fs;
+                        insert_band(
+                            &mut cache,
+                            CachedBand { proto, row0, rows, cols, scale_bits },
+                        );
+                        dirty = true;
+                    }
                 }
-                Ok(Response::Selection { id, rects, text }) => {
-                    // Only the latest request's result matters; drop stale ones
-                    // from a fast drag so the highlight doesn't flicker backward.
-                    if id == selection.req_id {
+                Ok(Response::Selection { epoch, id, rects, text }) => {
+                    // Only the latest request's result for the current document
+                    // matters; drop stale ones (fast drag, or a prior file).
+                    if epoch == doc_gen && id == selection.req_id {
                         selection.rects = rects;
                         if selection.copy_id == Some(id) {
                             super::clipboard::copy(&text);
@@ -658,11 +963,8 @@ fn ui_loop(
         });
         let covered = covering.is_some();
 
-        // Horizontal centering offset (cells) of the page on screen, mirroring
-        // the draw path, so screen↔page-pixel mapping for selection (and the
-        // overlay placement) lines up with the band.
-        let cols_disp = sw.div_ceil(cell_w) as u16;
-        let x_off = term_w.saturating_sub(cols_disp) / 2;
+        let x_off = layout.x_off;
+        let content_w_px = layout.content_w as u32 * cell_w;
 
         // 4. Draw.
         if dirty {
@@ -680,15 +982,30 @@ fn ui_loop(
             } else {
                 ""
             };
-            let status = format!(
-                " mdview · reading · {pct}%{state}    ↑/↓ j/k scroll · space page · g/G top/bottom · q quit "
-            );
+            let hint = match focus {
+                Focus::Sidebar => "↑/↓ select · ⏎ open · Tab read · q quit",
+                Focus::Reader => "Tab files · j/k scroll · space page · g/G ends · q quit",
+            };
+            let name = if title.is_empty() { "reading" } else { title.as_str() };
+            let status = format!(" mdview · {name} · {pct}%{state}    {hint} ");
             let status_rect = Rect::new(0, term_h.saturating_sub(1), term_w, 1);
             let full = Rect::new(0, 0, term_w, view_h);
+            let sidebar_focused = focus == Focus::Sidebar;
 
             let td = std::time::Instant::now();
             terminal.draw(|f| {
                 f.render_widget(Block::default().style(Style::default().bg(bg)), full);
+                // Sidebar first, then the band — disjoint column ranges, but
+                // rendering the sidebar every frame lets ratatui's diff clear any
+                // stale image cells at the seam after a band-narrowing resize.
+                if sidebar_w > 0 {
+                    let sb = Rect::new(0, 0, sidebar_w.saturating_sub(1), view_h);
+                    draw_sidebar(f, sb, tree, style, sidebar_focused);
+                    let div = Rect::new(sidebar_w - 1, 0, 1, view_h);
+                    let bar = Paragraph::new(vec![Line::from("│"); view_h as usize])
+                        .style(Style::default().fg(rgb(style.chrome)).bg(bg));
+                    f.render_widget(bar, div);
+                }
                 if let Some(b) = chosen {
                     // Offset of the viewport top within the band. When a fully
                     // covering band isn't ready yet (a fast scroll outran the
@@ -700,8 +1017,10 @@ fn ui_loop(
                     // the offset lies in `[0, rows - view_h]`.
                     let max_off = b.rows.saturating_sub(view_h as u32) as i64;
                     let offset = (view_top as i64 - b.row0 as i64).clamp(0, max_off) as i16;
-                    let x_off = (term_w.saturating_sub(b.cols)) / 2;
-                    let img_area = Rect::new(x_off, 0, b.cols.min(term_w), view_h);
+                    // Anchor at the unified x_off; clip width to the content area
+                    // so the band can never overdraw the sidebar columns.
+                    let img_w = b.cols.min(layout.content_w);
+                    let img_area = Rect::new(x_off, 0, img_w, view_h);
                     let position = SignedPosition::from((0, -offset));
                     f.render_widget(SlicedImage::new(&b.proto, position), img_area);
                 }
@@ -720,8 +1039,10 @@ fn ui_loop(
 
             // Selection highlight sits above the band as a separate kitty
             // placement; refresh it whenever the frame changed (scroll moves the
-            // rects; a drag changes them). Empty rects hide it.
+            // rects; a drag changes them). Empty rects hide it. Width is clamped
+            // to the content area so a clipped narrow page doesn't tint past it.
             let mut out = stdout();
+            let overlay_w = layout.sw.min(content_w_px);
             overlay.paint(
                 &mut out,
                 &selection.rects,
@@ -729,7 +1050,7 @@ fn ui_loop(
                 scroll_rows,
                 cell_h,
                 view_h,
-                sw,
+                overlay_w,
                 s,
             );
         }
@@ -740,17 +1061,115 @@ fn ui_loop(
         if event::poll(Duration::from_millis(poll_ms))? {
             for _ in 0..MAX_EVENTS_PER_FRAME {
                 let ev = event::read()?;
-                if handle_selection(
-                    &ev, &mut selection, req_tx, x_off, scroll_rows, cell_w, cell_h, s,
-                ) {
-                    dirty = true;
-                } else {
-                    match handle_event(ev, &mut scroll_rows, max_scroll, page) {
-                        RichEvent::Quit => return Ok(()),
-                        RichEvent::Changed => dirty = true,
-                        RichEvent::Ignored => {}
+
+                // Global keys (regardless of focus): quit, focus toggle. Resize
+                // just needs a redraw.
+                let mut handled = false;
+                match &ev {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Tab | KeyCode::BackTab => {
+                            if sidebar_w > 0 {
+                                focus = match focus {
+                                    Focus::Reader => Focus::Sidebar,
+                                    Focus::Sidebar => Focus::Reader,
+                                };
+                                dirty = true;
+                            }
+                            handled = true;
+                        }
+                        _ => {}
+                    },
+                    Event::Resize(_, _) => {
+                        dirty = true;
+                        handled = true;
+                    }
+                    _ => {}
+                }
+
+                // Mouse is routed by column, independent of keyboard focus: clicks
+                // and wheel over the sidebar drive the tree; elsewhere the reader.
+                if !handled
+                    && let Event::Mouse(m) = &ev
+                    && sidebar_w > 0
+                    && m.column < sidebar_w
+                {
+                    match m.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(idx) = tree.row_at(m.row as usize) {
+                                tree.select_index(idx);
+                                focus = Focus::Sidebar;
+                                if let Some(path) = tree.activate() {
+                                    switch_to(
+                                        &path, req_tx, &mut doc_gen, &mut cache,
+                                        &mut scroll_rows, &mut doc_total_h,
+                                        &mut fully_shaped, &mut last_target,
+                                        &mut selection, &mut overlay, &mut title,
+                                    );
+                                }
+                                dirty = true;
+                            }
+                        }
+                        MouseEventKind::ScrollDown => {
+                            tree.select_next();
+                            dirty = true;
+                        }
+                        MouseEventKind::ScrollUp => {
+                            tree.select_prev();
+                            dirty = true;
+                        }
+                        _ => {}
+                    }
+                    handled = true;
+                }
+
+                // Keyboard while the sidebar is focused drives tree navigation;
+                // everything else (reader keys, all content-area mouse) goes to
+                // the reader's selection + scroll handling.
+                if !handled {
+                    let sidebar_key = focus == Focus::Sidebar
+                        && matches!(&ev, Event::Key(k) if k.kind == KeyEventKind::Press);
+                    if sidebar_key {
+                        if let Event::Key(k) = &ev {
+                            match k.code {
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    tree.select_next();
+                                    dirty = true;
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    tree.select_prev();
+                                    dirty = true;
+                                }
+                                KeyCode::Enter
+                                | KeyCode::Char(' ')
+                                | KeyCode::Right
+                                | KeyCode::Left => {
+                                    if let Some(path) = tree.activate() {
+                                        switch_to(
+                                            &path, req_tx, &mut doc_gen, &mut cache,
+                                            &mut scroll_rows, &mut doc_total_h,
+                                            &mut fully_shaped, &mut last_target,
+                                            &mut selection, &mut overlay, &mut title,
+                                        );
+                                    }
+                                    dirty = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else if handle_selection(
+                        &ev, &mut selection, req_tx, x_off, scroll_rows, cell_w, cell_h, s,
+                    ) {
+                        dirty = true;
+                    } else {
+                        match handle_event(ev, &mut scroll_rows, max_scroll, page) {
+                            RichEvent::Quit => return Ok(()),
+                            RichEvent::Changed => dirty = true,
+                            RichEvent::Ignored => {}
+                        }
                     }
                 }
+
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }
@@ -778,7 +1197,14 @@ fn handle_selection(
     let point =
         || cell_to_page_px(m.column, m.row, x_off, scroll_rows, cell_w, cell_h, s);
     match m.kind {
+        // Only *start* a selection inside the page (at or right of `x_off`); a
+        // press in the left margin / gutter isn't a text selection. A drag that
+        // began in the page, though, keeps tracking even if it crosses left —
+        // `cell_to_page_px` clamps the head to page-x 0 — so it never wedges.
         MouseEventKind::Down(MouseButton::Left) => {
+            if m.column < x_off {
+                return false;
+            }
             selection.clear();
             selection.anchor = point();
             selection.dragging = true;
@@ -903,6 +1329,7 @@ that wraps across the measure to exercise line breaking.\n\n\
         };
 
         let target = Target {
+            epoch: 0,
             row0: 0,
             rows: 80,
             scale_bits: scale.to_bits(),
@@ -941,6 +1368,78 @@ that wraps across the measure to exercise line breaking.\n\n\
         handle.join().expect("worker thread should exit cleanly");
     }
 
+    /// After a `Load`, the worker must serve the *new* document and stamp every
+    /// response with the new generation — never the old one. This is the guard
+    /// against a stale band from the previous file flashing on screen (the
+    /// fit-scale is identical across a switch, so the epoch is the only signal).
+    #[test]
+    fn worker_switches_document_and_stamps_epoch() {
+        let md = sample_markdown(20);
+        let style = DocStyle::light();
+        let (cell_w, cell_h) = (8u32, 16u32);
+        let scale = 0.5f32;
+        let mk_target = |epoch: u64| Target {
+            epoch,
+            row0: 0,
+            rows: 80,
+            scale_bits: scale.to_bits(),
+            cell_w,
+            cell_h,
+            stride: 60,
+            max_row0: 10_000,
+        };
+
+        let (req_tx, req_rx) = mpsc::channel::<Request>();
+        let (resp_tx, resp_rx) = mpsc::channel::<Response>();
+        let handle = {
+            let style = style.clone();
+            let picker = headless_picker();
+            std::thread::spawn(move || render_worker(md, style, picker, None, req_rx, resp_tx))
+        };
+
+        // Serve the first document (epoch 0).
+        req_tx.send(Request::SetTarget(mk_target(0))).unwrap();
+        // Wait for a band of the wanted epoch. Bands from an *older* epoch may
+        // still be in the channel (e.g. a prefetched neighbor enqueued before
+        // the `Load` was drained) — those are exactly what the UI drops, so we
+        // skip them here. A band from a *newer* epoch would be a real bug.
+        let wait_band = |epoch_want: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
+                match resp_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(Response::Band { epoch, .. }) => {
+                        assert!(epoch <= epoch_want, "band stamped with a future epoch");
+                        if epoch == epoch_want {
+                            return true;
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+                }
+            }
+            false
+        };
+        assert!(wait_band(0), "no band for the initial document");
+
+        // Switch documents (epoch 1) and ask for the new top band.
+        req_tx
+            .send(Request::Load {
+                epoch: 1,
+                markdown: sample_markdown(5),
+                base_dir: None,
+            })
+            .unwrap();
+        req_tx.send(Request::SetTarget(mk_target(1))).unwrap();
+        assert!(
+            wait_band(1),
+            "worker did not serve the switched-to document with the new epoch"
+        );
+
+        req_tx.send(Request::Quit).unwrap();
+        handle.join().expect("worker thread should exit cleanly");
+    }
+
     /// A target past the end of the document must not hang or panic: the worker
     /// reports the (now exact) height instead of a band.
     #[test]
@@ -958,6 +1457,7 @@ that wraps across the measure to exercise line breaking.\n\n\
 
         // row0 far below any real content.
         let target = Target {
+            epoch: 0,
             row0: 1_000_000,
             rows: 80,
             scale_bits: 0.5f32.to_bits(),
@@ -980,17 +1480,17 @@ that wraps across the measure to exercise line breaking.\n\n\
     #[test]
     fn neighbors_are_clamped_and_distinct() {
         // Middle band: both neighbors valid and distinct.
-        let t = Target { row0: 100, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
+        let t = Target { epoch: 0, row0: 100, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
         let mut n = neighbor_row0s(&t);
         n.sort_unstable();
         assert_eq!(n, vec![40, 160]);
 
         // Top band: no upward neighbor.
-        let t = Target { row0: 0, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
+        let t = Target { epoch: 0, row0: 0, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
         assert_eq!(neighbor_row0s(&t), vec![60]);
 
         // Bottom band (row0 == max_row0): downward neighbor clamps away, only up.
-        let t = Target { row0: 500, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
+        let t = Target { epoch: 0, row0: 500, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
         assert_eq!(neighbor_row0s(&t), vec![440]);
     }
 
