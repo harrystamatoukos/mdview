@@ -154,10 +154,7 @@ fn transmit_classic(img: &RgbaImage, id: u32) -> String {
             let o = if zlib { "o=z," } else { "" };
             // `p=1` reuses a single placement so each drag tick *replaces* the
             // overlay (flicker-free) instead of stacking a new placement.
-            let _ = write!(
-                data,
-                "q=2,i={id},p=1,a=T,f=32,t=d,z=1,C=1,{o}s={w},v={h},"
-            );
+            let _ = write!(data, "q=2,i={id},p=1,a=T,f=32,t=d,z=1,C=1,{o}s={w},v={h},");
         }
         let more = u8::from(n > i + 1);
         let _ = write!(data, "m={more};");

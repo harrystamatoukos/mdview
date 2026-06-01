@@ -1,17 +1,19 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
 mod chart;
 #[cfg(feature = "rich")]
 mod filetree;
+mod highlight;
+mod mermaid;
+mod pager;
 mod parser;
 mod renderer;
 #[cfg(feature = "rich")]
 mod rich;
 mod theme;
 mod view;
-mod pager;
 mod watcher;
 
 use theme::{Theme, ThemeType};
@@ -107,7 +109,12 @@ fn main() -> Result<()> {
                 .filter(|p| !p.as_os_str().is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
-            (root, Some(args.path.clone()))
+            let focus = args
+                .path
+                .file_name()
+                .map(|name| root.join(name))
+                .unwrap_or_else(|| args.path.clone());
+            (root, Some(focus))
         };
 
         match rich::run(&root, focus.as_deref()) {
@@ -117,7 +124,9 @@ fn main() -> Result<()> {
                 // Fall back on a concrete file: the focus, else the first one
                 // in the tree, else there's nothing to show.
                 let file = focus.or_else(|| {
-                    filetree::FileTree::build(&root, None).ok().and_then(|t| t.first_file())
+                    filetree::FileTree::build(&root, None)
+                        .ok()
+                        .and_then(|t| t.first_file())
                 });
                 match file {
                     Some(f) => pager::run(&std::fs::read_to_string(&f)?, theme),

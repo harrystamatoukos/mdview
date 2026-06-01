@@ -9,15 +9,15 @@ use crossterm::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Text},
     widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
-    Frame, Terminal,
 };
 use std::io::{self, stdout};
 
@@ -65,7 +65,8 @@ impl Reader {
             self.width = width;
             self.text = renderer::render_to_text(&self.content, width, &self.theme);
             self.total_lines = self.text.lines.len();
-            self.view.clamp_to_content(self.total_lines, viewport_height);
+            self.view
+                .clamp_to_content(self.total_lines, viewport_height);
             true
         } else {
             false
@@ -91,7 +92,11 @@ pub fn run(content: &str, theme: Theme) -> Result<()> {
     let result = run_loop(&mut terminal, &mut reader);
 
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let _ = terminal.show_cursor();
 
     result
@@ -148,7 +153,9 @@ fn handle_event(input: Event, reader: &mut Reader, viewport_height: usize) -> Re
                 ReaderEvent::Changed
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                reader.view.scroll_down(1, reader.total_lines, viewport_height);
+                reader
+                    .view
+                    .scroll_down(1, reader.total_lines, viewport_height);
                 ReaderEvent::Changed
             }
             KeyCode::Char('u') => {
@@ -156,7 +163,9 @@ fn handle_event(input: Event, reader: &mut Reader, viewport_height: usize) -> Re
                 ReaderEvent::Changed
             }
             KeyCode::Char('d') => {
-                reader.view.scroll_down(viewport_height / 2, reader.total_lines, viewport_height);
+                reader
+                    .view
+                    .scroll_down(viewport_height / 2, reader.total_lines, viewport_height);
                 ReaderEvent::Changed
             }
             KeyCode::PageUp | KeyCode::Char('b') => {
@@ -164,7 +173,9 @@ fn handle_event(input: Event, reader: &mut Reader, viewport_height: usize) -> Re
                 ReaderEvent::Changed
             }
             KeyCode::PageDown | KeyCode::Char(' ') => {
-                reader.view.scroll_down(viewport_height, reader.total_lines, viewport_height);
+                reader
+                    .view
+                    .scroll_down(viewport_height, reader.total_lines, viewport_height);
                 ReaderEvent::Changed
             }
             KeyCode::Char('g') | KeyCode::Home => {
@@ -172,7 +183,9 @@ fn handle_event(input: Event, reader: &mut Reader, viewport_height: usize) -> Re
                 ReaderEvent::Changed
             }
             KeyCode::Char('G') | KeyCode::End => {
-                reader.view.scroll_to_bottom(reader.total_lines, viewport_height);
+                reader
+                    .view
+                    .scroll_to_bottom(reader.total_lines, viewport_height);
                 ReaderEvent::Changed
             }
             _ => ReaderEvent::Ignored,
@@ -183,7 +196,9 @@ fn handle_event(input: Event, reader: &mut Reader, viewport_height: usize) -> Re
                 ReaderEvent::Changed
             }
             MouseEventKind::ScrollDown => {
-                reader.view.scroll_down(3, reader.total_lines, viewport_height);
+                reader
+                    .view
+                    .scroll_down(3, reader.total_lines, viewport_height);
                 ReaderEvent::Changed
             }
             _ => ReaderEvent::Ignored,
@@ -213,7 +228,12 @@ fn draw(frame: &mut Frame, reader: &Reader, viewport_height: usize) {
     let total = reader.text.lines.len();
     let start = scroll_pos.min(total);
     let end = (scroll_pos + content_area.height as usize).min(total);
-    render_visible_lines(frame, &reader.text.lines[start..end], content_area, reader.theme.canvas());
+    render_visible_lines(
+        frame,
+        &reader.text.lines[start..end],
+        content_area,
+        reader.theme.canvas(),
+    );
 
     // Scrollbar
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -243,7 +263,8 @@ fn draw(frame: &mut Frame, reader: &Reader, viewport_height: usize) {
         width: area.width,
         height: 1,
     };
-    let status_bar = Paragraph::new(status).style(reader.theme.status_bar().add_modifier(Modifier::DIM));
+    let status_bar =
+        Paragraph::new(status).style(reader.theme.status_bar().add_modifier(Modifier::DIM));
     frame.render_widget(status_bar, status_rect);
 }
 

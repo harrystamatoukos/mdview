@@ -1,9 +1,8 @@
-use crate::parser::{self, Element, Span, SpanKind};
+use crate::parser::{self, CellAlign, Element, Span, SpanKind};
 use crate::theme::{
-    Theme, OPTIMAL_WIDTH, LEFT_MARGIN, MIN_MARGIN, TOP_PADDING,
-    HEADING_SPACING_MAJOR, HEADING_SPACING_MINOR, SECTION_SPACING,
-    BLOCKQUOTE_WIDTH_REDUCTION, NESTED_LIST_INDENT,
-    TABLE_LABEL_MAX_WIDTH, TABLE_CARD_THRESHOLD,
+    BLOCKQUOTE_WIDTH_REDUCTION, HEADING_SPACING_MAJOR, HEADING_SPACING_MINOR, LEFT_MARGIN,
+    MIN_MARGIN, NESTED_LIST_INDENT, OPTIMAL_WIDTH, SECTION_SPACING, TABLE_CARD_THRESHOLD,
+    TABLE_LABEL_MAX_WIDTH, TOP_PADDING, Theme,
 };
 use ratatui::style::Style;
 use ratatui::text::{Line, Span as TuiSpan, Text};
@@ -70,7 +69,9 @@ pub fn render_to_text(content: &str, terminal_width: u16, theme: &Theme) -> Text
     // Calculate centering: how much left margin to add.
     // Keep the math saturating so tiny terminal widths do not underflow.
     let terminal_width = terminal_width as usize;
-    let content_width = OPTIMAL_WIDTH.min(terminal_width.saturating_sub(LEFT_MARGIN)).max(1);
+    let content_width = OPTIMAL_WIDTH
+        .min(terminal_width.saturating_sub(LEFT_MARGIN))
+        .max(1);
     let left_margin = if terminal_width > content_width + LEFT_MARGIN {
         (terminal_width - content_width) / 2
     } else {
@@ -114,7 +115,11 @@ fn render_element_styled(
 ) {
     match element {
         Element::Heading { level, spans, .. } => {
-            let spacing_above = if *level <= 2 { HEADING_SPACING_MAJOR } else { HEADING_SPACING_MINOR };
+            let spacing_above = if *level <= 2 {
+                HEADING_SPACING_MAJOR
+            } else {
+                HEADING_SPACING_MINOR
+            };
             for _ in 0..spacing_above {
                 lines.push(Line::from(""));
             }
@@ -176,17 +181,32 @@ fn render_element_styled(
             lines.push(Line::from(""));
         }
 
-        Element::CodeBlock { code, .. } => {
+        Element::CodeBlock { code, lang } => {
             lines.push(Line::from(""));
 
-            // Code content - just indentation, no borders or boxes.
-            for code_line in code.lines() {
-                let mut builder = LineBuilder::new();
-                builder.push_raw(margin);
-                builder.push("        ", theme.body()); // 8-space indent for code
-                builder.push(code_line, theme.code_block());
-                lines.push(builder.finish());
+            // Syntax-highlighted content — indentation, no borders or boxes.
+            // Tokenize the whole block, then split tokens on newlines so each
+            // rendered line keeps its 8-space indent. Unknown languages yield a
+            // single Plain token → same as the previous flat rendering.
+            let trimmed = code.trim_end_matches('\n');
+            let mut builder = LineBuilder::new();
+            builder.push_raw(margin);
+            builder.push("        ", theme.body()); // 8-space indent for code
+            for tok in crate::highlight::highlight(trimmed, lang) {
+                let style = theme.code_token(tok.kind);
+                let mut parts = tok.text.split('\n');
+                if let Some(first) = parts.next() {
+                    builder.push(first, style);
+                }
+                for part in parts {
+                    lines.push(builder.finish());
+                    builder = LineBuilder::new();
+                    builder.push_raw(margin);
+                    builder.push("        ", theme.body());
+                    builder.push(part, style);
+                }
             }
+            lines.push(builder.finish());
 
             lines.push(Line::from(""));
         }
@@ -203,12 +223,30 @@ fn render_element_styled(
             lines.push(Line::from(""));
         }
 
+        Element::Mermaid { flowchart } => {
+            lines.push(Line::from(""));
+            for row in mermaid_text_lines(flowchart) {
+                let mut builder = LineBuilder::new();
+                builder.push_raw(margin);
+                builder.push("    ", theme.body());
+                builder.push(&row, theme.code_block());
+                lines.push(builder.finish());
+            }
+            lines.push(Line::from(""));
+        }
+
         Element::BlockQuote { elements, .. } => {
             lines.push(Line::from(""));
 
             for el in elements {
                 let mut quote_lines: Vec<Line<'static>> = Vec::new();
-                render_element_styled(el, &mut quote_lines, "", width.saturating_sub(BLOCKQUOTE_WIDTH_REDUCTION), theme);
+                render_element_styled(
+                    el,
+                    &mut quote_lines,
+                    "",
+                    width.saturating_sub(BLOCKQUOTE_WIDTH_REDUCTION),
+                    theme,
+                );
 
                 for line in quote_lines {
                     let is_empty = line.spans.iter().all(|s| s.content.trim().is_empty());
@@ -230,13 +268,14 @@ fn render_element_styled(
             lines.push(Line::from(""));
         }
 
-        Element::List { ordered, start, items, .. } => {
+        Element::List {
+            ordered,
+            start,
+            items,
+            ..
+        } => {
             for (i, item) in items.iter().enumerate() {
-                let marker = if *ordered {
-                    format!("  {}. ", start.unwrap_or(1) + i as u64)
-                } else {
-                    "  ◆  ".to_string()
-                };
+                let marker = styled_list_marker(*ordered, *start, i, item.task);
 
                 let marker_width = marker.chars().count();
                 let text_width = width.saturating_sub(marker_width);
@@ -262,7 +301,13 @@ fn render_element_styled(
 
                 for block in &item.blocks {
                     let nested_margin = format!("{}{}", margin, " ".repeat(NESTED_LIST_INDENT));
-                    render_element_styled(block, lines, &nested_margin, width.saturating_sub(NESTED_LIST_INDENT), theme);
+                    render_element_styled(
+                        block,
+                        lines,
+                        &nested_margin,
+                        width.saturating_sub(NESTED_LIST_INDENT),
+                        theme,
+                    );
                 }
             }
             lines.push(Line::from(""));
@@ -284,7 +329,11 @@ fn render_element_styled(
             }
         }
 
-        Element::Table { headers, rows, .. } => {
+        Element::Table {
+            headers,
+            rows,
+            aligns,
+        } => {
             lines.push(Line::from(""));
 
             let natural_widths: Vec<usize> = headers
@@ -301,10 +350,11 @@ fn render_element_styled(
                 })
                 .collect();
 
-            let natural_total: usize = natural_widths.iter().sum::<usize>() + (headers.len().max(1) - 1) * 3 + 4;
+            let natural_total: usize =
+                natural_widths.iter().sum::<usize>() + (headers.len().max(1) - 1) * 3 + 4;
 
             if natural_total <= width {
-                render_table_tabular(lines, margin, headers, rows, &natural_widths, theme);
+                render_table_tabular(lines, margin, headers, rows, aligns, &natural_widths, theme);
             } else {
                 render_table_cards(lines, margin, headers, rows, width, theme);
             }
@@ -446,6 +496,7 @@ fn render_table_tabular(
     margin: &str,
     headers: &[String],
     rows: &[Vec<String>],
+    aligns: &[CellAlign],
     col_widths: &[usize],
     theme: &Theme,
 ) {
@@ -454,7 +505,10 @@ fn render_table_tabular(
     // Top border
     let mut builder = LineBuilder::new();
     builder.push_raw(margin);
-    builder.push(&format!("  ┌{}┐", "─".repeat(total_width.saturating_sub(2))), theme.table_border());
+    builder.push(
+        &format!("  ┌{}┐", "─".repeat(total_width.saturating_sub(2))),
+        theme.table_border(),
+    );
     lines.push(builder.finish());
 
     // Header row
@@ -463,7 +517,11 @@ fn render_table_tabular(
     builder.push("  │", theme.table_border());
     for (i, h) in headers.iter().enumerate() {
         let w = col_widths[i];
-        builder.push(&format!(" {:<width$}", h, width = w), theme.table_header());
+        let align = aligns.get(i).copied().unwrap_or(CellAlign::Left);
+        builder.push(
+            &format!(" {}", align_cell(h, w, align)),
+            theme.table_header(),
+        );
         if i < headers.len() - 1 {
             builder.push(" │", theme.table_border());
         }
@@ -475,7 +533,10 @@ fn render_table_tabular(
     let sep_parts: Vec<String> = col_widths.iter().map(|w| "─".repeat(*w + 2)).collect();
     let mut builder = LineBuilder::new();
     builder.push_raw(margin);
-    builder.push(&format!("  ├{}┤", sep_parts.join("┼")), theme.table_border());
+    builder.push(
+        &format!("  ├{}┤", sep_parts.join("┼")),
+        theme.table_border(),
+    );
     lines.push(builder.finish());
 
     // Data rows
@@ -483,10 +544,12 @@ fn render_table_tabular(
         let mut builder = LineBuilder::new();
         builder.push_raw(margin);
         builder.push("  │", theme.table_border());
-        for (i, c) in row.iter().enumerate() {
+        for i in 0..headers.len() {
+            let c = row.get(i).map(String::as_str).unwrap_or("");
             let w = col_widths.get(i).copied().unwrap_or(10);
-            builder.push(&format!(" {:<width$}", c, width = w), theme.body());
-            if i < row.len() - 1 {
+            let align = aligns.get(i).copied().unwrap_or(CellAlign::Left);
+            builder.push(&format!(" {}", align_cell(c, w, align)), theme.body());
+            if i < headers.len() - 1 {
                 builder.push(" │", theme.table_border());
             }
         }
@@ -497,7 +560,10 @@ fn render_table_tabular(
     // Bottom border
     let mut builder = LineBuilder::new();
     builder.push_raw(margin);
-    builder.push(&format!("  └{}┘", "─".repeat(total_width.saturating_sub(2))), theme.table_border());
+    builder.push(
+        &format!("  └{}┘", "─".repeat(total_width.saturating_sub(2))),
+        theme.table_border(),
+    );
     lines.push(builder.finish());
 }
 
@@ -510,7 +576,11 @@ fn render_table_cards(
     width: usize,
     theme: &Theme,
 ) {
-    let max_header_len = headers.iter().map(|h| h.chars().count()).max().unwrap_or(10);
+    let max_header_len = headers
+        .iter()
+        .map(|h| h.chars().count())
+        .max()
+        .unwrap_or(10);
     let label_width = max_header_len.min(TABLE_LABEL_MAX_WIDTH);
     let value_width = width.saturating_sub(label_width + BLOCKQUOTE_WIDTH_REDUCTION);
 
@@ -536,7 +606,10 @@ fn render_table_cards(
                 let mut builder = LineBuilder::new();
                 builder.push_raw(margin);
                 if line_idx == 0 {
-                    builder.push(&format!("  {:<width$}", header, width = label_width), theme.table_header());
+                    builder.push(
+                        &format!("  {:<width$}", header, width = label_width),
+                        theme.table_header(),
+                    );
                     builder.push("  ", theme.body());
                 } else {
                     builder.push_raw(&" ".repeat(label_width + 4));
@@ -598,6 +671,60 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+fn styled_list_marker(
+    ordered: bool,
+    start: Option<u64>,
+    index: usize,
+    task: Option<bool>,
+) -> String {
+    match (ordered, task) {
+        (true, Some(done)) => format!(
+            "  {}. {} ",
+            start.unwrap_or(1) + index as u64,
+            if done { "☑" } else { "☐" }
+        ),
+        (true, None) => format!("  {}. ", start.unwrap_or(1) + index as u64),
+        (false, Some(true)) => "  ☑  ".to_string(),
+        (false, Some(false)) => "  ☐  ".to_string(),
+        (false, None) => "  ◆  ".to_string(),
+    }
+}
+
+fn plain_list_marker(
+    ordered: bool,
+    start: Option<u64>,
+    index: usize,
+    task: Option<bool>,
+) -> String {
+    match (ordered, task) {
+        (true, Some(done)) => format!(
+            "{}. [{}] ",
+            start.unwrap_or(1) + index as u64,
+            if done { "x" } else { " " }
+        ),
+        (true, None) => format!("{}. ", start.unwrap_or(1) + index as u64),
+        (false, Some(done)) => format!("[{}] ", if done { "x" } else { " " }),
+        (false, None) => "•  ".to_string(),
+    }
+}
+
+fn align_cell(text: &str, width: usize, align: CellAlign) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        return text.to_string();
+    }
+    let pad = width - len;
+    match align {
+        CellAlign::Left => format!("{text}{}", " ".repeat(pad)),
+        CellAlign::Right => format!("{}{text}", " ".repeat(pad)),
+        CellAlign::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Plain text rendering (for --print mode)
 // ─────────────────────────────────────────────────────────────
@@ -642,6 +769,14 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
             output.push('\n');
             output
         }
+        Element::Mermaid { flowchart } => {
+            let mut output = String::from("\n");
+            for row in mermaid_text_lines(flowchart) {
+                output.push_str(&format!("{}    {}\n", margin, row));
+            }
+            output.push('\n');
+            output
+        }
         Element::BlockQuote { elements, .. } => {
             let mut output = String::from("\n");
             for el in elements {
@@ -653,14 +788,15 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
             output.push('\n');
             output
         }
-        Element::List { ordered, start, items, .. } => {
+        Element::List {
+            ordered,
+            start,
+            items,
+            ..
+        } => {
             let mut output = String::new();
             for (i, item) in items.iter().enumerate() {
-                let marker = if *ordered {
-                    format!("{}. ", start.unwrap_or(1) + i as u64)
-                } else {
-                    "•  ".to_string()
-                };
+                let marker = plain_list_marker(*ordered, *start, i, item.task);
                 let text = render_spans_to_string(&item.spans);
                 output.push_str(&format!("{}  {}{}\n", margin, marker, text));
 
@@ -680,7 +816,11 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
                 "\n".repeat(SECTION_SPACING)
             )
         }
-        Element::Table { headers, rows, .. } => {
+        Element::Table {
+            headers,
+            rows,
+            aligns,
+        } => {
             let mut output = String::from("\n");
 
             let col_widths: Vec<usize> = headers
@@ -697,36 +837,53 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
                 })
                 .collect();
 
-            let total_width: usize = col_widths.iter().sum::<usize>() + (headers.len().max(1) - 1) * 3 + 4;
+            let total_width: usize =
+                col_widths.iter().sum::<usize>() + (headers.len().max(1) - 1) * 3 + 4;
 
             if total_width <= TABLE_CARD_THRESHOLD {
-                output.push_str(&format!("{}┌{}┐\n", margin, "─".repeat(total_width.saturating_sub(2))));
+                output.push_str(&format!(
+                    "{}┌{}┐\n",
+                    margin,
+                    "─".repeat(total_width.saturating_sub(2))
+                ));
 
                 let header_cells: Vec<String> = headers
                     .iter()
                     .enumerate()
-                    .map(|(i, h)| format!(" {:<width$} ", h, width = col_widths[i]))
+                    .map(|(i, h)| {
+                        let align = aligns.get(i).copied().unwrap_or(CellAlign::Left);
+                        format!(" {} ", align_cell(h, col_widths[i], align))
+                    })
                     .collect();
                 output.push_str(&format!("{}│{}│\n", margin, header_cells.join("│")));
 
-                let sep_parts: Vec<String> = col_widths.iter().map(|w| "─".repeat(*w + 2)).collect();
+                let sep_parts: Vec<String> =
+                    col_widths.iter().map(|w| "─".repeat(*w + 2)).collect();
                 output.push_str(&format!("{}├{}┤\n", margin, sep_parts.join("┼")));
 
                 for row in rows {
-                    let row_cells: Vec<String> = row
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| {
+                    let row_cells: Vec<String> = (0..headers.len())
+                        .map(|i| {
+                            let c = row.get(i).map(String::as_str).unwrap_or("");
                             let w = col_widths.get(i).copied().unwrap_or(10);
-                            format!(" {:<width$} ", c, width = w)
+                            let align = aligns.get(i).copied().unwrap_or(CellAlign::Left);
+                            format!(" {} ", align_cell(c, w, align))
                         })
                         .collect();
                     output.push_str(&format!("{}│{}│\n", margin, row_cells.join("│")));
                 }
 
-                output.push_str(&format!("{}└{}┘\n", margin, "─".repeat(total_width.saturating_sub(2))));
+                output.push_str(&format!(
+                    "{}└{}┘\n",
+                    margin,
+                    "─".repeat(total_width.saturating_sub(2))
+                ));
             } else {
-                let max_header_len = headers.iter().map(|h| h.chars().count()).max().unwrap_or(10);
+                let max_header_len = headers
+                    .iter()
+                    .map(|h| h.chars().count())
+                    .max()
+                    .unwrap_or(10);
                 let label_width = max_header_len.min(TABLE_LABEL_MAX_WIDTH);
                 let separator_width = OPTIMAL_WIDTH.saturating_sub(8);
 
@@ -734,11 +891,22 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
                     if row_idx > 0 {
                         output.push('\n');
                     }
-                    output.push_str(&format!("{}─── {} {}\n", margin, row_idx + 1, "─".repeat(separator_width)));
+                    output.push_str(&format!(
+                        "{}─── {} {}\n",
+                        margin,
+                        row_idx + 1,
+                        "─".repeat(separator_width)
+                    ));
 
                     for (i, header) in headers.iter().enumerate() {
                         let value = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                        output.push_str(&format!("{}{:<width$}  {}\n", margin, header, value, width = label_width));
+                        output.push_str(&format!(
+                            "{}{:<width$}  {}\n",
+                            margin,
+                            header,
+                            value,
+                            width = label_width
+                        ));
                     }
                 }
             }
@@ -753,15 +921,44 @@ fn render_element_plain(element: &Element, indent: usize) -> String {
 // CHART TEXT FALLBACK - charts as text for the --tui and --print readers
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Render a mermaid flowchart as a plain-text edge list — the non-graphical
+/// fallback. Each edge becomes `From ──(label)──▶ To`; an edgeless graph just
+/// lists its node labels.
+fn mermaid_text_lines(fc: &crate::mermaid::Flowchart) -> Vec<String> {
+    if fc.edges.is_empty() {
+        return fc.nodes.iter().map(|n| n.label.clone()).collect();
+    }
+    fc.edges
+        .iter()
+        .map(|e| {
+            let conn = match (&e.label, e.arrow) {
+                (Some(l), true) => format!("──({l})──▶"),
+                (Some(l), false) => format!("──({l})──"),
+                (None, true) => "─────▶".to_string(),
+                (None, false) => "──────".to_string(),
+            };
+            format!(
+                "{}  {}  {}",
+                fc.nodes[e.from].label, conn, fc.nodes[e.to].label
+            )
+        })
+        .collect()
+}
+
 /// Render a chart as plain text rows: ranked block bars for bar/pie, a unicode
 /// sparkline per series for line, a range summary for scatter. "Defined, not
 /// pretty, not broken" — the fallback contract for non-graphical readers.
 fn chart_text_lines(chart: &crate::chart::Chart, width: usize) -> Vec<String> {
-    use crate::chart::{fmt_num, ChartKind};
+    use crate::chart::{ChartKind, fmt_num};
 
     let mut out = Vec::new();
     if let Some(t) = &chart.title {
         out.push(t.clone());
+    }
+    if let Some(axis) = chart_axis_line(chart) {
+        out.push(axis);
+    }
+    if !out.is_empty() {
         out.push(String::new());
     }
     let bar_w = width.clamp(16, 80) / 3; // bar column ≈ a third of the measure
@@ -769,7 +966,13 @@ fn chart_text_lines(chart: &crate::chart::Chart, width: usize) -> Vec<String> {
     match chart.kind {
         ChartKind::Bar => {
             let max = chart.y_max();
-            let label_w = chart.x.iter().map(|s| s.chars().count()).max().unwrap_or(0).min(18);
+            let label_w = chart
+                .x
+                .iter()
+                .map(|s| s.chars().count())
+                .max()
+                .unwrap_or(0)
+                .min(18);
             let single = chart.series.len() <= 1;
             for series in &chart.series {
                 if !single {
@@ -786,8 +989,17 @@ fn chart_text_lines(chart: &crate::chart::Chart, width: usize) -> Vec<String> {
             let total: f64 = chart.data.iter().map(|(_, v)| *v).sum();
             let mut rows = chart.data.clone();
             rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let max = rows.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max).max(f64::MIN_POSITIVE);
-            let label_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0).min(18);
+            let max = rows
+                .iter()
+                .map(|(_, v)| *v)
+                .fold(0.0_f64, f64::max)
+                .max(f64::MIN_POSITIVE);
+            let label_w = rows
+                .iter()
+                .map(|(k, _)| k.chars().count())
+                .max()
+                .unwrap_or(0)
+                .min(18);
             for (k, v) in rows {
                 let bars = "█".repeat(((v / max) * bar_w as f64).round() as usize);
                 let pct = if total > 0.0 { v / total * 100.0 } else { 0.0 };
@@ -796,9 +1008,18 @@ fn chart_text_lines(chart: &crate::chart::Chart, width: usize) -> Vec<String> {
         }
         ChartKind::Line => {
             for series in &chart.series {
-                let name = if series.name.is_empty() { "series" } else { &series.name };
+                let name = if series.name.is_empty() {
+                    "series"
+                } else {
+                    &series.name
+                };
                 let (mn, mx) = minmax(&series.y);
-                out.push(format!("{name}: {}  ({}..{})", sparkline(&series.y), fmt_num(mn), fmt_num(mx)));
+                out.push(format!(
+                    "{name}: {}  ({}..{})",
+                    sparkline(&series.y),
+                    fmt_num(mn),
+                    fmt_num(mx)
+                ));
             }
         }
         ChartKind::Scatter => {
@@ -819,10 +1040,27 @@ fn chart_text_lines(chart: &crate::chart::Chart, width: usize) -> Vec<String> {
     out
 }
 
+fn chart_axis_line(chart: &crate::chart::Chart) -> Option<String> {
+    match (&chart.xlabel, &chart.ylabel) {
+        (Some(x), Some(y)) => Some(format!("x: {x} · y: {y}")),
+        (Some(x), None) => Some(format!("x: {x}")),
+        (None, Some(y)) => Some(format!("y: {y}")),
+        (None, None) => None,
+    }
+}
+
 /// One labeled horizontal bar: `label  ████ value`.
 fn bar_row(label: &str, v: f64, max: f64, label_w: usize, bar_w: usize) -> String {
-    let n = if max > 0.0 { ((v / max) * bar_w as f64).round() as usize } else { 0 };
-    format!("{label:<label_w$} {} {}", "█".repeat(n), crate::chart::fmt_num(v))
+    let n = if max > 0.0 {
+        ((v / max) * bar_w as f64).round() as usize
+    } else {
+        0
+    };
+    format!(
+        "{label:<label_w$} {} {}",
+        "█".repeat(n),
+        crate::chart::fmt_num(v)
+    )
 }
 
 /// A compact unicode sparkline of a numeric series.
@@ -843,4 +1081,44 @@ fn minmax(v: &[f64]) -> (f64, f64) {
     let mn = v.iter().copied().fold(f64::MAX, f64::min);
     let mx = v.iter().copied().fold(f64::MIN, f64::max);
     (mn, mx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chart::{Chart, ChartKind};
+
+    #[test]
+    fn task_markers_survive_in_fallback_renderers() {
+        assert_eq!(styled_list_marker(false, None, 0, Some(true)), "  ☑  ");
+        assert_eq!(styled_list_marker(false, None, 0, Some(false)), "  ☐  ");
+        assert_eq!(plain_list_marker(false, None, 0, Some(true)), "[x] ");
+        assert_eq!(plain_list_marker(true, Some(3), 1, Some(false)), "4. [ ] ");
+    }
+
+    #[test]
+    fn table_cell_alignment_is_explicit() {
+        assert_eq!(align_cell("x", 5, CellAlign::Left), "x    ");
+        assert_eq!(align_cell("x", 5, CellAlign::Right), "    x");
+        assert_eq!(align_cell("x", 5, CellAlign::Center), "  x  ");
+    }
+
+    #[test]
+    fn chart_axis_labels_are_available_to_text_fallbacks() {
+        let chart = Chart {
+            kind: ChartKind::Bar,
+            title: None,
+            xlabel: Some("Month".to_string()),
+            ylabel: Some("Revenue".to_string()),
+            x: vec!["Jan".to_string()],
+            series: Vec::new(),
+            points: Vec::new(),
+            data: Vec::new(),
+        };
+
+        assert_eq!(
+            chart_axis_line(&chart),
+            Some("x: Month · y: Revenue".to_string())
+        );
+    }
 }

@@ -20,7 +20,7 @@
 //! Within a band, scrolling only moves a cell offset (`SlicedImage`) — nothing
 //! is re-encoded or re-transmitted.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::io::stdout;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Duration;
@@ -31,16 +31,16 @@ use crossterm::{
         MouseButton, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use image::DynamicImage;
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
-    Terminal,
 };
 use ratatui_image::{
     picker::Picker,
@@ -128,24 +128,31 @@ pub fn run(root: &Path, focus: Option<&Path>) -> Result<()> {
     // sidebar opens with something selected and revealed.
     let initial = match focus {
         Some(f) => Some(f.to_path_buf()),
-        None => FileTree::build(root, None).ok().and_then(|t| t.first_file()),
+        None => FileTree::build(root, None)
+            .ok()
+            .and_then(|t| t.first_file()),
     };
     let mut tree = FileTree::build(root, initial.as_deref())?;
 
-    let (markdown, base_dir) = match initial.as_deref() {
-        Some(path) => (
-            std::fs::read_to_string(path).unwrap_or_default(),
-            path.parent().map(|p| p.to_path_buf()),
-        ),
+    let (markdown, base_dir, title) = match initial.as_deref() {
+        Some(path) => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match std::fs::read_to_string(path) {
+                Ok(content) => (content, path.parent().map(|p| p.to_path_buf()), name),
+                Err(e) => (
+                    String::new(),
+                    path.parent().map(|p| p.to_path_buf()),
+                    format!("⚠ cannot open {name}: {e}"),
+                ),
+            }
+        }
         // No markdown anywhere under root: open an empty reader alongside the
         // (empty) sidebar rather than erroring.
-        None => (String::new(), Some(root.to_path_buf())),
+        None => (String::new(), Some(root.to_path_buf()), String::new()),
     };
-    let title = initial
-        .as_deref()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
 
     enable_raw_mode()?;
 
@@ -163,10 +170,21 @@ pub fn run(root: &Path, focus: Option<&Path>) -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &picker, &markdown, base_dir, &mut tree, title);
+    let result = run_loop(
+        &mut terminal,
+        &picker,
+        &markdown,
+        base_dir,
+        &mut tree,
+        title,
+    );
 
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let _ = terminal.show_cursor();
 
     result
@@ -239,7 +257,11 @@ enum Response {
     },
     /// Background-shaping progress: the document's height estimate grew (or
     /// became exact). Lets the UI refine its scroll bounds.
-    Progress { epoch: u64, total_h: u32, fully_shaped: bool },
+    Progress {
+        epoch: u64,
+        total_h: u32,
+        fully_shaped: bool,
+    },
     /// Resolved selection: highlight rects (page device px) + text to copy.
     /// `id` echoes the request so the UI can ignore stale drag results.
     Selection {
@@ -405,7 +427,11 @@ fn render_worker(
                 Ok(Request::Caret { id, motion, top }) => {
                     pending_caret.push((id, motion, top));
                 }
-                Ok(Request::Load { epoch: g, markdown, base_dir }) => {
+                Ok(Request::Load {
+                    epoch: g,
+                    markdown,
+                    base_dir,
+                }) => {
                     // Switch documents: re-lay out on the existing painter, then
                     // forget everything tied to the old doc.
                     epoch = g;
@@ -426,7 +452,12 @@ fn render_worker(
                 Some(s) => (s.rects, s.text),
                 None => (Vec::new(), String::new()),
             };
-            let _ = resp_tx.send(Response::Selection { epoch, id, rects, text });
+            let _ = resp_tx.send(Response::Selection {
+                epoch,
+                id,
+                rects,
+                text,
+            });
             continue 'main;
         }
         if !pending_caret.is_empty() {
@@ -446,7 +477,13 @@ fn render_worker(
                     copy_text = r.copy_text;
                 }
             }
-            let _ = resp_tx.send(Response::Caret { epoch, id: last_id, caret, rects, copy_text });
+            let _ = resp_tx.send(Response::Caret {
+                epoch,
+                id: last_id,
+                caret,
+                rects,
+                copy_text,
+            });
             continue 'main;
         }
 
@@ -476,7 +513,9 @@ fn render_worker(
             for nrow0 in neighbor_row0s(&t) {
                 let nkey = (nrow0, t.scale_bits);
                 if !produced.contains(&nkey) {
-                    if let Some(resp) = render_band(&mut painter, &mut doc, &picker, &t, nrow0, epoch) {
+                    if let Some(resp) =
+                        render_band(&mut painter, &mut doc, &picker, &t, nrow0, epoch)
+                    {
                         let _ = resp_tx.send(resp);
                     }
                     remember(&mut produced, nkey);
@@ -520,7 +559,11 @@ fn render_worker(
             Ok(Request::Caret { id, motion, top }) => {
                 pending_caret.push((id, motion, top));
             }
-            Ok(Request::Load { epoch: g, markdown, base_dir }) => {
+            Ok(Request::Load {
+                epoch: g,
+                markdown,
+                base_dir,
+            }) => {
                 epoch = g;
                 doc = reload_doc(&mut painter, &style, &markdown, base_dir);
                 produced.clear();
@@ -646,7 +689,9 @@ fn run_loop(
         let markdown = markdown.to_string();
         let style = style.clone();
         let picker = picker.clone();
-        std::thread::spawn(move || render_worker(markdown, style, picker, base_dir, req_rx, resp_tx))
+        std::thread::spawn(move || {
+            render_worker(markdown, style, picker, base_dir, req_rx, resp_tx)
+        })
     };
 
     let result = ui_loop(
@@ -793,7 +838,9 @@ impl Layout {
 
         // Document height as scrollable cell-rows at this scale (0 until known).
         let doc_rows = if doc_total_h > 0 {
-            ((doc_total_h as f32 * s).round() as u32).div_ceil(cell_h).max(1)
+            ((doc_total_h as f32 * s).round() as u32)
+                .div_ceil(cell_h)
+                .max(1)
         } else {
             view_h as u32
         };
@@ -937,7 +984,10 @@ fn draw_sidebar(
         ];
         // Search results carry a dimmed locator ("parent · N matches").
         if let Some(detail) = &r.detail {
-            spans.push(Span::styled(format!("  {detail}"), Style::default().fg(dim)));
+            spans.push(Span::styled(
+                format!("  {detail}"),
+                Style::default().fg(dim),
+            ));
         }
         let mut line = Line::from(spans);
         if idx == selected {
@@ -999,7 +1049,11 @@ fn ui_loop(
         // to 0 if it would leave too little room to read comfortably.
         let sidebar_w = if sidebar_enabled {
             let w = SIDEBAR_W.min(term_w / 3);
-            if term_w.saturating_sub(w) < MIN_CONTENT_CELLS { 0 } else { w }
+            if term_w.saturating_sub(w) < MIN_CONTENT_CELLS {
+                0
+            } else {
+                w
+            }
         } else {
             0
         };
@@ -1015,7 +1069,14 @@ fn ui_loop(
         }
 
         let layout = Layout::compute(
-            term_w, term_h, sidebar_w, page_w, cell_w, cell_h, doc_total_h, scroll_rows,
+            term_w,
+            term_h,
+            sidebar_w,
+            page_w,
+            cell_w,
+            cell_h,
+            doc_total_h,
+            scroll_rows,
         );
         let view_h = layout.view_h;
         let scale_bits = layout.scale_bits;
@@ -1043,7 +1104,11 @@ fn ui_loop(
         //    `scale_bits` alone wouldn't catch it.
         loop {
             match resp_rx.try_recv() {
-                Ok(Response::Progress { epoch, total_h, fully_shaped: fs }) => {
+                Ok(Response::Progress {
+                    epoch,
+                    total_h,
+                    fully_shaped: fs,
+                }) => {
                     if epoch == doc_gen {
                         doc_total_h = total_h;
                         fully_shaped = fs;
@@ -1065,12 +1130,23 @@ fn ui_loop(
                         fully_shaped = fs;
                         insert_band(
                             &mut cache,
-                            CachedBand { proto, row0, rows, cols, scale_bits },
+                            CachedBand {
+                                proto,
+                                row0,
+                                rows,
+                                cols,
+                                scale_bits,
+                            },
                         );
                         dirty = true;
                     }
                 }
-                Ok(Response::Selection { epoch, id, rects, text }) => {
+                Ok(Response::Selection {
+                    epoch,
+                    id,
+                    rects,
+                    text,
+                }) => {
                     // Only the latest request's result for the current document
                     // matters; drop stale ones (fast drag, or a prior file).
                     if epoch == doc_gen && id == selection.req_id {
@@ -1082,7 +1158,13 @@ fn ui_loop(
                         dirty = true;
                     }
                 }
-                Ok(Response::Caret { epoch, id, caret: crect, rects, copy_text }) => {
+                Ok(Response::Caret {
+                    epoch,
+                    id,
+                    caret: crect,
+                    rects,
+                    copy_text,
+                }) => {
                     if epoch == doc_gen && id == caret.req_id {
                         caret.rect = crect;
                         caret.sel = rects;
@@ -1177,7 +1259,11 @@ fn ui_loop(
                         Focus::Sidebar => "↑/↓ select · ⏎ open · / find · Tab read · q quit",
                         Focus::Reader => "Tab files · / find · v cursor · j/k scroll · q quit",
                     };
-                    let name = if title.is_empty() { "reading" } else { title.as_str() };
+                    let name = if title.is_empty() {
+                        "reading"
+                    } else {
+                        title.as_str()
+                    };
                     format!(" mdview · {name} · {pct}%{state}    {hint} ")
                 }
             };
@@ -1372,11 +1458,19 @@ fn ui_loop(
                                 focus = Focus::Sidebar;
                                 if let Some(path) = tree.activate() {
                                     switch_to(
-                                        &path, req_tx, &mut doc_gen, &mut cache,
-                                        &mut scroll_rows, &mut doc_total_h,
-                                        &mut fully_shaped, &mut last_target,
-                                        &mut selection, &mut overlay, &mut title,
-                                        &mut current_path, &mut caret,
+                                        &path,
+                                        req_tx,
+                                        &mut doc_gen,
+                                        &mut cache,
+                                        &mut scroll_rows,
+                                        &mut doc_total_h,
+                                        &mut fully_shaped,
+                                        &mut last_target,
+                                        &mut selection,
+                                        &mut overlay,
+                                        &mut title,
+                                        &mut current_path,
+                                        &mut caret,
                                     );
                                 }
                                 dirty = true;
@@ -1418,11 +1512,19 @@ fn ui_loop(
                                 | KeyCode::Left => {
                                     if let Some(path) = tree.activate() {
                                         switch_to(
-                                            &path, req_tx, &mut doc_gen, &mut cache,
-                                            &mut scroll_rows, &mut doc_total_h,
-                                            &mut fully_shaped, &mut last_target,
-                                            &mut selection, &mut overlay, &mut title,
-                                            &mut current_path, &mut caret,
+                                            &path,
+                                            req_tx,
+                                            &mut doc_gen,
+                                            &mut cache,
+                                            &mut scroll_rows,
+                                            &mut doc_total_h,
+                                            &mut fully_shaped,
+                                            &mut last_target,
+                                            &mut selection,
+                                            &mut overlay,
+                                            &mut title,
+                                            &mut current_path,
+                                            &mut caret,
                                         );
                                     }
                                     dirty = true;
@@ -1454,7 +1556,11 @@ fn ui_loop(
                         // In cursor mode: caret keys move/select; the view follows.
                         caret.req_id += 1;
                         let top = (scroll_rows as f32 * cell_h as f32 / s).max(0.0) as u32;
-                        let _ = req_tx.send(Request::Caret { id: caret.req_id, motion, top });
+                        let _ = req_tx.send(Request::Caret {
+                            id: caret.req_id,
+                            motion,
+                            top,
+                        });
                         match motion {
                             CaretMotion::VisualStart => caret.selecting = !caret.selecting,
                             CaretMotion::Copy => {
@@ -1470,7 +1576,14 @@ fn ui_loop(
                         }
                         dirty = true;
                     } else if handle_selection(
-                        &ev, &mut selection, req_tx, x_off, scroll_rows, cell_w, cell_h, s,
+                        &ev,
+                        &mut selection,
+                        req_tx,
+                        x_off,
+                        scroll_rows,
+                        cell_w,
+                        cell_h,
+                        s,
                     ) {
                         dirty = true;
                     } else {
@@ -1506,8 +1619,7 @@ fn handle_selection(
     s: f32,
 ) -> bool {
     let Event::Mouse(m) = ev else { return false };
-    let point =
-        || cell_to_page_px(m.column, m.row, x_off, scroll_rows, cell_w, cell_h, s);
+    let point = || cell_to_page_px(m.column, m.row, x_off, scroll_rows, cell_w, cell_h, s);
     match m.kind {
         // Only *start* a selection inside the page (at or right of `x_off`); a
         // press in the left margin / gutter isn't a text selection. A drag that
@@ -1657,7 +1769,14 @@ that wraps across the measure to exercise line breaking.\n\n\
         let mut got_band = false;
         while std::time::Instant::now() < deadline {
             match resp_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(Response::Band { rows, cols, total_h, scale_bits, row0, .. }) => {
+                Ok(Response::Band {
+                    rows,
+                    cols,
+                    total_h,
+                    scale_bits,
+                    row0,
+                    ..
+                }) => {
                     assert_eq!(row0, 0);
                     assert_eq!(scale_bits, scale.to_bits());
                     assert!(cols > 0, "band should have a positive cell width");
@@ -1783,7 +1902,10 @@ that wraps across the measure to exercise line breaking.\n\n\
         // We should still get a height report (Progress, or a clamped Band) and
         // be able to shut down — the key property is "no hang/panic".
         let resp = resp_rx.recv_timeout(Duration::from_secs(20));
-        assert!(resp.is_ok(), "worker should respond even for an out-of-range target");
+        assert!(
+            resp.is_ok(),
+            "worker should respond even for an out-of-range target"
+        );
 
         req_tx.send(Request::Quit).unwrap();
         handle.join().expect("worker thread should exit cleanly");
@@ -1792,17 +1914,44 @@ that wraps across the measure to exercise line breaking.\n\n\
     #[test]
     fn neighbors_are_clamped_and_distinct() {
         // Middle band: both neighbors valid and distinct.
-        let t = Target { epoch: 0, row0: 100, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
+        let t = Target {
+            epoch: 0,
+            row0: 100,
+            rows: 80,
+            scale_bits: 0,
+            cell_w: 8,
+            cell_h: 16,
+            stride: 60,
+            max_row0: 500,
+        };
         let mut n = neighbor_row0s(&t);
         n.sort_unstable();
         assert_eq!(n, vec![40, 160]);
 
         // Top band: no upward neighbor.
-        let t = Target { epoch: 0, row0: 0, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
+        let t = Target {
+            epoch: 0,
+            row0: 0,
+            rows: 80,
+            scale_bits: 0,
+            cell_w: 8,
+            cell_h: 16,
+            stride: 60,
+            max_row0: 500,
+        };
         assert_eq!(neighbor_row0s(&t), vec![60]);
 
         // Bottom band (row0 == max_row0): downward neighbor clamps away, only up.
-        let t = Target { epoch: 0, row0: 500, rows: 80, scale_bits: 0, cell_w: 8, cell_h: 16, stride: 60, max_row0: 500 };
+        let t = Target {
+            epoch: 0,
+            row0: 500,
+            rows: 80,
+            scale_bits: 0,
+            cell_w: 8,
+            cell_h: 16,
+            stride: 60,
+            max_row0: 500,
+        };
         assert_eq!(neighbor_row0s(&t), vec![440]);
     }
 
@@ -1812,7 +1961,11 @@ that wraps across the measure to exercise line breaking.\n\n\
             // A trivial 1x1 protocol via the headless picker.
             proto: SlicedProtocol::new(
                 &headless_picker(),
-                DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 16, image::Rgba([255, 255, 255, 255]))),
+                DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                    8,
+                    16,
+                    image::Rgba([255, 255, 255, 255]),
+                )),
                 Some(Size::new(1, 1)),
             )
             .unwrap(),
@@ -1835,6 +1988,10 @@ that wraps across the measure to exercise line breaking.\n\n\
         let keep = cache[cache.len() - 1].row0;
         insert_band(&mut cache, mk(keep));
         assert_eq!(cache.len(), before, "dedup keeps length stable");
-        assert_eq!(cache.last().unwrap().row0, keep, "re-inserted band is newest");
+        assert_eq!(
+            cache.last().unwrap().row0,
+            keep,
+            "re-inserted band is newest"
+        );
     }
 }

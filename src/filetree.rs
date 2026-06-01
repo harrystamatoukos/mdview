@@ -74,7 +74,10 @@ pub struct FileTree {
 /// Whether a path looks like a markdown file by extension.
 fn is_markdown(path: &Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
         Some("md") | Some("markdown")
     )
 }
@@ -132,9 +135,11 @@ fn scan(dir: &Path) -> Option<Node> {
 /// Directories first, then files; alphabetical (case-insensitive) within each.
 fn sort_children(children: &mut [Node]) {
     children.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
     });
 }
 
@@ -355,7 +360,10 @@ impl FileTree {
         self.scroll = 0;
         if q.is_empty() {
             self.search = Some(Vec::new());
-            return SearchOutcome { matched: 0, truncated: false };
+            return SearchOutcome {
+                matched: 0,
+                truncated: false,
+            };
         }
 
         let mut files: Vec<PathBuf> = Vec::new();
@@ -397,7 +405,10 @@ impl FileTree {
                 if !detail.is_empty() {
                     detail.push_str(" · ");
                 }
-                detail.push_str(&format!("{count} match{}", if count == 1 { "" } else { "es" }));
+                detail.push_str(&format!(
+                    "{count} match{}",
+                    if count == 1 { "" } else { "es" }
+                ));
             }
             let detail = (!detail.is_empty()).then(|| truncate_str(&detail, MAX_DETAIL_LEN));
 
@@ -428,7 +439,10 @@ impl FileTree {
                 })
                 .then_with(|| b.count.cmp(&a.count))
                 .then_with(|| {
-                    a.row.name.to_ascii_lowercase().cmp(&b.row.name.to_ascii_lowercase())
+                    a.row
+                        .name
+                        .to_ascii_lowercase()
+                        .cmp(&b.row.name.to_ascii_lowercase())
                 })
         });
 
@@ -588,7 +602,11 @@ mod tests {
         let tree = FileTree::build(&root, None).unwrap();
         let names: Vec<_> = tree.visible().iter().map(|r| r.name.as_str()).collect();
         // Directory first, then files alphabetically.
-        assert_eq!(names, vec!["subdir", "alpha.md", "zeta.md"], "got {names:?}");
+        assert_eq!(
+            names,
+            vec!["subdir", "alpha.md", "zeta.md"],
+            "got {names:?}"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -606,7 +624,11 @@ mod tests {
         tree.select_index(0);
         assert!(tree.activate().is_none(), "activating a dir returns None");
         let names: Vec<_> = tree.visible().iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["docs", "guide.md", "top.md"], "expanded: {names:?}");
+        assert_eq!(
+            names,
+            vec!["docs", "guide.md", "top.md"],
+            "expanded: {names:?}"
+        );
         // Collapse again.
         tree.select_index(0);
         tree.activate();
@@ -640,7 +662,10 @@ mod tests {
         touch(&root.join("only.md"));
         let mut tree = FileTree::build(&root, None).unwrap();
         tree.select_index(0);
-        assert_eq!(tree.activate().as_deref(), Some(root.join("only.md").as_path()));
+        assert_eq!(
+            tree.activate().as_deref(),
+            Some(root.join("only.md").as_path())
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -696,7 +721,11 @@ mod tests {
         fs::write(root.join("api.md"), b"# API\nendpoints\n").unwrap();
         fs::create_dir_all(root.join("guide")).unwrap();
         // No "api" in the name, but it appears in the body twice.
-        fs::write(root.join("guide/intro.md"), b"the api is great; api again\n").unwrap();
+        fs::write(
+            root.join("guide/intro.md"),
+            b"the api is great; api again\n",
+        )
+        .unwrap();
         fs::write(root.join("unrelated.md"), b"nothing relevant here\n").unwrap();
 
         let mut tree = FileTree::build(&root, None).unwrap();
@@ -715,7 +744,10 @@ mod tests {
         );
         // Activating a result returns its path (never toggles a tree dir).
         tree.select_index(1);
-        assert_eq!(tree.activate().as_deref(), Some(root.join("guide/intro.md").as_path()));
+        assert_eq!(
+            tree.activate().as_deref(),
+            Some(root.join("guide/intro.md").as_path())
+        );
 
         // Gibberish → no matches.
         let none = tree.set_search("zzzqqq");

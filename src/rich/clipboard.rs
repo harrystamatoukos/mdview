@@ -29,8 +29,7 @@ pub fn copy(text: &str) {
 /// Standard base64 (RFC 4648) encoding. Hand-rolled to keep the dependency tree
 /// lean — the payloads here are short selections, so speed is irrelevant.
 pub(super) fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;

@@ -112,9 +112,12 @@ scrolling.
 ## What it renders
 
 Headings, paragraphs, **bold** / *italic* / `inline code`, links, ordered &
-unordered (nested) lists, task lists, footnotes, blockquotes, fenced code blocks,
-horizontal rules, tables (tabular when they fit, card layout when too wide), and
-native **charts** (see below).
+unordered (nested) lists, task lists, footnotes, blockquotes, fenced code blocks
+with **syntax highlighting** (Rust, Python, JS/TS, Go, C/C++, Java, Bash, Ruby,
+SQL, JSON, YAML, TOML), horizontal rules, tables (tabular when they fit, card
+layout when too wide), native **charts** (see below), and **Mermaid flowcharts**
+— drawn as real diagrams in the graphical reader, and shown as an edge list in
+the text reader. Unsupported Mermaid diagram types fall back to their source.
 
 ## Charts
 

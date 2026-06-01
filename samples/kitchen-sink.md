@@ -104,10 +104,65 @@ fn longish(argument_one: u32, argument_two: u32, argument_three: u32) -> u32 {
 }
 ```
 
+Syntax highlighting across languages (keywords, types, strings, numbers,
+comments, function calls — kept subtle so code still reads as code):
+
+```python
+def fib(n: int) -> list:
+    """First n Fibonacci numbers."""
+    a, b = 0, 1
+    seq = []
+    while len(seq) < n:
+        seq.append(a)
+        a, b = b, a + b
+    return seq  # done
+```
+
+```bash
+# build every sample to PNG
+for f in *.md; do
+    mdview --export-png "out/${f%.md}.png" "$f"
+done
+```
+
+```json
+{ "name": "mdview", "version": "0.1.6", "highlight": true, "langs": ["rust", null] }
+```
+
+```sql
+SELECT id, name FROM users WHERE active = true ORDER BY created_at DESC LIMIT 10;
+```
+
 Indented code block (4 spaces):
 
     let indented = true;
     // four-space indented code
+
+## Mermaid diagrams
+
+Flowcharts render natively (nodes, shapes, labelled edges); other mermaid types
+fall back to their source.
+
+```mermaid
+graph TD
+    A[Start] --> B{Logged in?}
+    B -->|yes| C[Show dashboard]
+    B -->|no| D[Show login]
+    D --> E((Auth))
+    E --> B
+    C --> F([Done])
+```
+
+Left-to-right with mixed shapes:
+
+```mermaid
+flowchart LR
+    Ingest[Ingest data] --> Clean(Clean)
+    Clean --> Model{Valid?}
+    Model -- yes --> Store[(Store)]
+    Model -- no --> Drop[Drop]
+    Store --> Report([Report])
+```
 
 ## Tables
 

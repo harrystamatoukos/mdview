@@ -15,7 +15,7 @@ use cosmic_text::{
     Align, Attrs, Buffer, Color, Cursor, Family, FontSystem, Metrics, Motion, Shaping,
     Style as FontStyle, SwashCache, Weight,
 };
-use image::{imageops, imageops::FilterType, Rgba, RgbaImage};
+use image::{Rgba, RgbaImage, imageops, imageops::FilterType};
 
 use crate::parser::{CellAlign, Element, Span, SpanKind};
 
@@ -67,21 +67,21 @@ impl DocStyle {
             content_px: (base_px * 33.0) as u32,
             margin_px: (base_px * 1.8) as u32,
             pad_px: (base_px * 1.8) as u32,
-            bg: (252, 252, 252),  // #FCFCFC essentially white
-            ink: (26, 26, 26),    // #1A1A1A near-black body
+            bg: (252, 252, 252), // #FCFCFC essentially white
+            ink: (26, 26, 26),   // #1A1A1A near-black body
             h: [
-                (0, 0, 0),     // h1 black
-                (26, 26, 26),  // h2
-                (45, 45, 45),  // h3
-                (70, 70, 70),  // h4
-                (95, 95, 95),  // h5
-                (95, 95, 95),  // h6 (same, rendered dimmer)
+                (0, 0, 0),    // h1 black
+                (26, 26, 26), // h2
+                (45, 45, 45), // h3
+                (70, 70, 70), // h4
+                (95, 95, 95), // h5
+                (95, 95, 95), // h6 (same, rendered dimmer)
             ],
-            accent: (120, 120, 120), // neutral gray for bullets/bars/rules
-            code: (70, 70, 70),      // dark gray; mono font also sets it apart
+            accent: (120, 120, 120),  // neutral gray for bullets/bars/rules
+            code: (70, 70, 70),       // dark gray; mono font also sets it apart
             code_bg: (236, 236, 239), // faint cool-gray chip behind inline code
-            link: (26, 95, 180),     // #1A5FB4 classic readable blue
-            chrome: (200, 200, 200), // #C8C8C8 light borders
+            link: (26, 95, 180),      // #1A5FB4 classic readable blue
+            chrome: (200, 200, 200),  // #C8C8C8 light borders
         }
     }
 
@@ -111,6 +111,26 @@ impl DocStyle {
     fn para_space(&self) -> u32 {
         (self.base_px * 0.9) as u32
     }
+
+    /// Syntax-highlight color for a code token. Deliberately *muted* — color
+    /// should help the eye parse structure without out-shouting the prose
+    /// (DESIGN_RESEARCH §"code blocks"). Base text (Plain/Punct) stays at the
+    /// near-black ink the block used before highlighting, so unhighlighted
+    /// languages look exactly as they did.
+    fn syntax_color(&self, kind: crate::highlight::TokenKind) -> Rgb {
+        use crate::highlight::TokenKind::*;
+        match kind {
+            Plain => self.ink,
+            Punct => (90, 90, 90),
+            Comment => (150, 150, 150), // gray, recedes
+            Keyword => (149, 51, 119),  // muted plum
+            Type => (32, 110, 160),     // muted blue
+            Builtin => (170, 95, 30),   // amber
+            Str => (60, 130, 80),       // muted green
+            Number => (170, 95, 30),    // amber (pairs with Builtin)
+            Function => (50, 90, 175),  // blue (distinct from link; no underline)
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -130,6 +150,9 @@ struct Run {
 
 /// Glyph metadata tag marking a run that wants an inline-code background chip.
 const PILL_META: usize = 1;
+/// Smallest scale applied to an over-wide code block before falling back to
+/// wrapping. Below this, code becomes harder to read than a wrapped line.
+const MIN_CODE_SCALE: f32 = 0.68;
 
 impl Run {
     fn attrs(&self, st: &DocStyle) -> Attrs<'static> {
@@ -138,9 +161,10 @@ impl Run {
         } else {
             Family::Name(st.body_font)
         };
-        let mut a = Attrs::new()
-            .family(family)
-            .color(Color::rgb(self.color.0, self.color.1, self.color.2));
+        let mut a =
+            Attrs::new()
+                .family(family)
+                .color(Color::rgb(self.color.0, self.color.1, self.color.2));
         if self.bold {
             a = a.weight(Weight::BOLD);
         }
@@ -157,28 +181,64 @@ impl Run {
 /// Flatten inline spans into (text, Run) pairs, resolving emphasis/strong/
 /// code/link to concrete weights, styles, and colors.
 fn flatten_spans(spans: &[Span], st: &DocStyle, base_color: Rgb) -> Vec<(String, Run)> {
-    let body = Run { bold: false, italic: false, mono: false, pill: false, color: base_color };
+    let body = Run {
+        bold: false,
+        italic: false,
+        mono: false,
+        pill: false,
+        color: base_color,
+    };
     let mut out: Vec<(String, Run)> = Vec::new();
     for span in spans {
         match &span.kind {
             SpanKind::Text(t) => out.push((t.clone(), body)),
-            SpanKind::Emphasis(t) => out.push((t.clone(), Run { italic: true, ..body })),
+            SpanKind::Emphasis(t) => out.push((
+                t.clone(),
+                Run {
+                    italic: true,
+                    ..body
+                },
+            )),
             SpanKind::Strong(t) => out.push((t.clone(), Run { bold: true, ..body })),
-            SpanKind::StrongEmphasis(t) => {
-                out.push((t.clone(), Run { bold: true, italic: true, ..body }))
-            }
-            SpanKind::Code(t) => {
-                out.push((t.clone(), Run { mono: true, pill: true, color: st.code, ..body }))
-            }
-            SpanKind::Link { text, .. } => {
-                out.push((text.clone(), Run { color: st.link, ..body }))
-            }
+            SpanKind::StrongEmphasis(t) => out.push((
+                t.clone(),
+                Run {
+                    bold: true,
+                    italic: true,
+                    ..body
+                },
+            )),
+            SpanKind::Code(t) => out.push((
+                t.clone(),
+                Run {
+                    mono: true,
+                    pill: true,
+                    color: st.code,
+                    ..body
+                },
+            )),
+            SpanKind::Link { text, .. } => out.push((
+                text.clone(),
+                Run {
+                    color: st.link,
+                    ..body
+                },
+            )),
             // Images are lifted out and rendered as their own blocks; ignore here.
             SpanKind::Image { .. } => {}
-            SpanKind::Strikethrough(t) => out.push((t.clone(), Run { color: st.chrome, ..body })),
+            SpanKind::Strikethrough(t) => out.push((
+                t.clone(),
+                Run {
+                    color: st.chrome,
+                    ..body
+                },
+            )),
             SpanKind::FootnoteRef { number, .. } => out.push((
                 crate::parser::superscript(*number),
-                Run { color: st.link, ..body },
+                Run {
+                    color: st.link,
+                    ..body
+                },
             )),
             SpanKind::SoftBreak => out.push((" ".to_string(), body)),
             SpanKind::HardBreak => out.push(("\n".to_string(), body)),
@@ -210,7 +270,13 @@ struct Block {
 /// A primitive drawn directly onto the page (bars, rules, bullets).
 enum Decoration {
     /// Filled rectangle (x, y, w, h) relative to the block origin, in device px.
-    Rect { x: i32, y: i32, w: u32, h: u32, color: Rgb },
+    Rect {
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        color: Rgb,
+    },
     /// Pre-rendered bitmap blitted at (x, y) relative to the block origin.
     /// Used for tables, which can't fit the single-buffer block model.
     Image { x: i32, y: i32, img: RgbaImage },
@@ -260,8 +326,10 @@ fn fast_core_font_system() -> Option<FontSystem> {
     }
 
     // Require both families to actually be present before trusting the db.
-    let has_family =
-        |name: &str| db.faces().any(|f| f.families.iter().any(|(fam, _)| fam.as_str() == name));
+    let has_family = |name: &str| {
+        db.faces()
+            .any(|f| f.families.iter().any(|(fam, _)| fam.as_str() == name))
+    };
     if !has_family("Georgia") || !has_family("Menlo") {
         return None;
     }
@@ -278,7 +346,9 @@ fn fast_core_font_system() -> Option<FontSystem> {
 /// full-DB load inherits it. Defaults to `en-US`.
 fn detect_locale() -> String {
     for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
-        let Ok(val) = std::env::var(key) else { continue };
+        let Ok(val) = std::env::var(key) else {
+            continue;
+        };
         let loc = val.split('.').next().unwrap_or(&val);
         if !loc.is_empty() && loc != "C" && loc != "POSIX" {
             return loc.replace('_', "-");
@@ -406,11 +476,7 @@ impl RichDoc {
     /// Build highlight rects + copyable text between two `(block, cursor)`
     /// endpoints (given in any order). Shared by mouse selection and the
     /// keyboard caret's visual mode.
-    pub fn select_cursors(
-        &self,
-        a: (usize, Cursor),
-        b: (usize, Cursor),
-    ) -> SelectionRender {
+    pub fn select_cursors(&self, a: (usize, Cursor), b: (usize, Cursor)) -> SelectionRender {
         // Order by (block, line, index) so start <= end.
         let (start, end) = if (a.0, a.1.line, a.1.index) <= (b.0, b.1.line, b.1.index) {
             (a, b)
@@ -421,16 +487,27 @@ impl RichDoc {
         let mut rects = Vec::new();
         let mut text = String::new();
         for bi in start.0..=end.0 {
-            let Some(block) = self.blocks.get(bi) else { break };
+            let Some(block) = self.blocks.get(bi) else {
+                break;
+            };
             let ox = (self.margin_px + block.indent) as f32;
             let last = block_end_cursor(&block.buffer);
-            let cs = if bi == start.0 { start.1 } else { Cursor::new(0, 0) };
+            let cs = if bi == start.0 {
+                start.1
+            } else {
+                Cursor::new(0, 0)
+            };
             let ce = if bi == end.0 { end.1 } else { last };
 
             for run in block.buffer.layout_runs() {
                 for (hx, hw) in run.highlight(cs, ce) {
                     if hw > 0.0 {
-                        rects.push((ox + hx, block.y_top as f32 + run.line_top, hw, run.line_height));
+                        rects.push((
+                            ox + hx,
+                            block.y_top as f32 + run.line_top,
+                            hw,
+                            run.line_height,
+                        ));
                     }
                 }
             }
@@ -558,7 +635,10 @@ fn cursor_geom(buffer: &Buffer, cursor: &Cursor) -> Option<(f32, f32, f32)> {
     buffer
         .layout_runs()
         .filter(|run| run.line_i == cursor.line)
-        .find_map(|run| run.cursor_position(cursor).map(|x| (x, run.line_top, run.line_height)))
+        .find_map(|run| {
+            run.cursor_position(cursor)
+                .map(|x| (x, run.line_top, run.line_height))
+        })
 }
 
 /// First/last/adjacent **text** block indices (the caret only rests on these).
@@ -577,7 +657,9 @@ fn next_text_block(blocks: &[Placed], from: usize) -> Option<usize> {
         .map(|(i, _)| i)
 }
 fn prev_text_block(blocks: &[Placed], from: usize) -> Option<usize> {
-    blocks.get(..from).and_then(|s| s.iter().rposition(|b| b.text))
+    blocks
+        .get(..from)
+        .and_then(|s| s.iter().rposition(|b| b.text))
 }
 
 impl Painter {
@@ -715,7 +797,11 @@ impl Painter {
                 // Copy the selection (if any), then leave cursor mode.
                 let copy_text = doc.selection_text();
                 doc.caret = None;
-                return CaretRender { caret: None, rects: Vec::new(), copy_text };
+                return CaretRender {
+                    caret: None,
+                    rects: Vec::new(),
+                    copy_text,
+                };
             }
             _ => {
                 if doc.caret.is_none() {
@@ -743,10 +829,15 @@ impl Painter {
             .or_else(|| first_text_block(&doc.blocks));
         if let Some(block) = block {
             let b = &doc.blocks[block];
-            let local_y = (hint_y.saturating_sub(b.y_top) as f32)
-                .min(b.height.saturating_sub(1) as f32);
+            let local_y =
+                (hint_y.saturating_sub(b.y_top) as f32).min(b.height.saturating_sub(1) as f32);
             let cursor = b.buffer.hit(0.0, local_y).unwrap_or(Cursor::new(0, 0));
-            doc.caret = Some(Caret { block, cursor, desired_x: None, anchor: None });
+            doc.caret = Some(Caret {
+                block,
+                cursor,
+                desired_x: None,
+                anchor: None,
+            });
         }
     }
 
@@ -755,10 +846,7 @@ impl Painter {
     /// content.
     fn ensure_text_after(&mut self, doc: &mut RichDoc, block: usize) {
         let mut guard = 0;
-        while !doc.fully_shaped
-            && next_text_block(&doc.blocks, block).is_none()
-            && guard < 512
-        {
+        while !doc.fully_shaped && next_text_block(&doc.blocks, block).is_none() && guard < 512 {
             self.shape_step(doc, 4);
             guard += 1;
         }
@@ -767,10 +855,16 @@ impl Painter {
     /// Move the caret by one motion, crossing block boundaries when cosmic-text
     /// reports no progress within the current block.
     fn move_caret(&mut self, doc: &mut RichDoc, action: CaretMotion) {
-        let Some(mut c) = doc.caret.take() else { return };
+        let Some(mut c) = doc.caret.take() else {
+            return;
+        };
         match action {
             CaretMotion::Left | CaretMotion::WordPrev => {
-                let m = if action == CaretMotion::Left { Motion::Left } else { Motion::PreviousWord };
+                let m = if action == CaretMotion::Left {
+                    Motion::Left
+                } else {
+                    Motion::PreviousWord
+                };
                 let moved = doc.blocks[c.block]
                     .buffer
                     .cursor_motion(&mut self.font_system, c.cursor, None, m)
@@ -788,7 +882,11 @@ impl Painter {
             }
             CaretMotion::Right | CaretMotion::WordNext => {
                 self.ensure_text_after(doc, c.block);
-                let m = if action == CaretMotion::Right { Motion::Right } else { Motion::NextWord };
+                let m = if action == CaretMotion::Right {
+                    Motion::Right
+                } else {
+                    Motion::NextWord
+                };
                 let moved = doc.blocks[c.block]
                     .buffer
                     .cursor_motion(&mut self.font_system, c.cursor, None, m)
@@ -829,8 +927,7 @@ impl Painter {
                             prev_text_block(&doc.blocks, c.block)
                         };
                         if let Some(nb) = nb {
-                            let dx = (c.desired_x.unwrap_or(0.0)
-                                - doc.blocks[nb].indent as f32)
+                            let dx = (c.desired_x.unwrap_or(0.0) - doc.blocks[nb].indent as f32)
                                 .max(0.0);
                             let by = if down {
                                 0.0
@@ -850,7 +947,12 @@ impl Painter {
                     c.block = fb;
                     c.cursor = doc.blocks[fb]
                         .buffer
-                        .cursor_motion(&mut self.font_system, Cursor::new(0, 0), None, Motion::BufferStart)
+                        .cursor_motion(
+                            &mut self.font_system,
+                            Cursor::new(0, 0),
+                            None,
+                            Motion::BufferStart,
+                        )
                         .map(|(nc, _)| nc)
                         .unwrap_or(Cursor::new(0, 0));
                 }
@@ -888,7 +990,14 @@ impl Painter {
         {
             let st = &doc.style;
             let el = &doc.elements[i];
-            self.lay_out(std::slice::from_ref(el), st, st.content_px, 0, &mut blocks, i == 0);
+            self.lay_out(
+                std::slice::from_ref(el),
+                st,
+                st.content_px,
+                0,
+                &mut blocks,
+                i == 0,
+            );
         }
 
         // Position the new blocks below what's already placed.
@@ -1032,7 +1141,13 @@ impl Painter {
 
             for d in &p.decorations {
                 match d {
-                    Decoration::Rect { x, y: dy, w, h, color } => {
+                    Decoration::Rect {
+                        x,
+                        y: dy,
+                        w,
+                        h,
+                        color,
+                    } => {
                         fill_rect(&mut img, ox + x, oy + dy, *w, *h, *color);
                     }
                     Decoration::Image { x, y: dy, img: src } => {
@@ -1145,8 +1260,13 @@ impl Painter {
                             .collect();
                         (runs, 0, Vec::new())
                     };
-                    let (buffer, height) =
-                        self.shape(&runs, st, Metrics::new(size, lh), width - indent, Align::Left);
+                    let (buffer, height) = self.shape(
+                        &runs,
+                        st,
+                        Metrics::new(size, lh),
+                        width - indent,
+                        Align::Left,
+                    );
                     out.push(Block {
                         buffer,
                         line_height: lh,
@@ -1163,7 +1283,9 @@ impl Painter {
 
                 Element::Paragraph { spans, .. } => {
                     let lh = st.base_px * 1.55;
-                    let has_image = spans.iter().any(|s| matches!(s.kind, SpanKind::Image { .. }));
+                    let has_image = spans
+                        .iter()
+                        .any(|s| matches!(s.kind, SpanKind::Image { .. }));
                     if !has_image {
                         let runs = flatten_spans(spans, st, st.ink);
                         let (buffer, height) =
@@ -1180,29 +1302,44 @@ impl Painter {
                         // Lift images out as their own blocks; shape the text
                         // segments around them as separate paragraphs.
                         let mut seg: Vec<Span> = Vec::new();
-                        let flush_seg = |me: &mut Self, seg: &mut Vec<Span>, out: &mut Vec<Block>| {
-                            if seg.is_empty() {
-                                return;
-                            }
-                            let runs = flatten_spans(seg, st, st.ink);
-                            let (buffer, height) =
-                                me.shape(&runs, st, Metrics::new(st.base_px, lh), width, Align::Left);
-                            out.push(Block {
-                                buffer,
-                                line_height: lh,
-                                height,
-                                indent: base_indent,
-                                space_before: st.para_space(),
-                                decorations: Vec::new(),
-                            });
-                            seg.clear();
-                        };
+                        let flush_seg =
+                            |me: &mut Self, seg: &mut Vec<Span>, out: &mut Vec<Block>| {
+                                if seg.is_empty() {
+                                    return;
+                                }
+                                let runs = flatten_spans(seg, st, st.ink);
+                                let (buffer, height) = me.shape(
+                                    &runs,
+                                    st,
+                                    Metrics::new(st.base_px, lh),
+                                    width,
+                                    Align::Left,
+                                );
+                                out.push(Block {
+                                    buffer,
+                                    line_height: lh,
+                                    height,
+                                    indent: base_indent,
+                                    space_before: st.para_space(),
+                                    decorations: Vec::new(),
+                                });
+                                seg.clear();
+                            };
                         for span in spans {
                             if let SpanKind::Image { url, alt } = &span.kind {
                                 flush_seg(self, &mut seg, out);
                                 let (img, height) = self.image_block(url, alt, st, width);
                                 let (buffer, _) = self.shape(
-                                    &[(String::new(), Run { bold: false, italic: false, mono: false, pill: false, color: st.ink })],
+                                    &[(
+                                        String::new(),
+                                        Run {
+                                            bold: false,
+                                            italic: false,
+                                            mono: false,
+                                            pill: false,
+                                            color: st.ink,
+                                        },
+                                    )],
                                     st,
                                     Metrics::new(st.base_px, st.base_px),
                                     width,
@@ -1224,7 +1361,12 @@ impl Painter {
                     }
                 }
 
-                Element::List { ordered, start, items, .. } => {
+                Element::List {
+                    ordered,
+                    start,
+                    items,
+                    ..
+                } => {
                     let marker_w = (st.base_px * 1.6) as u32;
                     for (i, item) in items.iter().enumerate() {
                         let runs = flatten_spans(&item.spans, st, st.ink);
@@ -1236,7 +1378,11 @@ impl Painter {
                             width.saturating_sub(marker_w),
                             Align::Left,
                         );
-                        let marker_space = if i == 0 { st.para_space() } else { (st.base_px * 0.3) as u32 };
+                        let marker_space = if i == 0 {
+                            st.para_space()
+                        } else {
+                            (st.base_px * 0.3) as u32
+                        };
                         if let Some(checked) = item.task {
                             // Task-list checkbox glyph drawn as a small bitmap,
                             // vertically centered on the first text line.
@@ -1244,7 +1390,16 @@ impl Painter {
                             let cb = make_checkbox(checked, box_sz, st);
                             let y_off = ((lh - box_sz as f32) / 2.0).max(0.0) as i32;
                             let (mbuf, _) = self.shape(
-                                &[(String::new(), Run { bold: false, italic: false, mono: false, pill: false, color: st.accent })],
+                                &[(
+                                    String::new(),
+                                    Run {
+                                        bold: false,
+                                        italic: false,
+                                        mono: false,
+                                        pill: false,
+                                        color: st.accent,
+                                    },
+                                )],
                                 st,
                                 Metrics::new(st.base_px, lh),
                                 marker_w,
@@ -1257,7 +1412,11 @@ impl Painter {
                                 indent: base_indent
                                     + marker_w.saturating_sub(box_sz + (st.base_px * 0.35) as u32),
                                 space_before: marker_space,
-                                decorations: vec![Decoration::Image { x: 0, y: y_off, img: cb }],
+                                decorations: vec![Decoration::Image {
+                                    x: 0,
+                                    y: y_off,
+                                    img: cb,
+                                }],
                             });
                         } else {
                             // Marker as its own little shaped buffer, accent-colored.
@@ -1268,15 +1427,27 @@ impl Painter {
                             };
                             let mrun = vec![(
                                 marker_text,
-                                Run { bold: false, italic: false, mono: false, pill: false, color: st.accent },
+                                Run {
+                                    bold: false,
+                                    italic: false,
+                                    mono: false,
+                                    pill: false,
+                                    color: st.accent,
+                                },
                             )];
-                            let (mbuf, _) =
-                                self.shape(&mrun, st, Metrics::new(st.base_px, lh), marker_w, Align::Left);
+                            let (mbuf, _) = self.shape(
+                                &mrun,
+                                st,
+                                Metrics::new(st.base_px, lh),
+                                marker_w,
+                                Align::Left,
+                            );
                             out.push(Block {
                                 buffer: mbuf,
                                 line_height: lh,
                                 height: 0, // marker overlays the item; no own height
-                                indent: base_indent + marker_w.saturating_sub((st.base_px * 1.1) as u32),
+                                indent: base_indent
+                                    + marker_w.saturating_sub((st.base_px * 1.1) as u32),
                                 space_before: marker_space,
                                 decorations: Vec::new(),
                             });
@@ -1307,7 +1478,14 @@ impl Painter {
                     let gap = (st.base_px * 0.7) as u32;
                     let inner_indent = base_indent + bar_w + gap;
                     let before = out.len();
-                    self.lay_out(elements, st, width.saturating_sub(bar_w + gap), inner_indent, out, false);
+                    self.lay_out(
+                        elements,
+                        st,
+                        width.saturating_sub(bar_w + gap),
+                        inner_indent,
+                        out,
+                        false,
+                    );
                     // Italicize the quote and add a vertical accent bar spanning it.
                     let mut span_h: u32 = 0;
                     for b in &mut out[before..] {
@@ -1325,14 +1503,59 @@ impl Painter {
                     }
                 }
 
-                Element::CodeBlock { code, .. } => {
+                Element::CodeBlock { code, lang } => {
                     let lh = st.base_px * 1.45;
                     let size = st.base_px * 0.92;
-                    let runs = vec![(
-                        code.trim_end_matches('\n').to_string(),
-                        Run { bold: false, italic: false, mono: true, pill: false, color: st.ink },
-                    )];
+                    // Tokenize once for the whole block (so multi-line strings /
+                    // block comments highlight correctly) and map each token to a
+                    // mono run in its theme color. Unknown languages yield a single
+                    // Plain token → identical to the pre-highlight rendering.
+                    let trimmed = code.trim_end_matches('\n');
+                    let mut runs: Vec<(String, Run)> = crate::highlight::highlight(trimmed, lang)
+                        .into_iter()
+                        .map(|tok| {
+                            let color = st.syntax_color(tok.kind);
+                            let italic = tok.kind == crate::highlight::TokenKind::Comment;
+                            (
+                                tok.text.to_string(),
+                                Run {
+                                    bold: false,
+                                    italic,
+                                    mono: true,
+                                    pill: false,
+                                    color,
+                                },
+                            )
+                        })
+                        .collect();
+                    if runs.is_empty() {
+                        runs.push((
+                            String::new(),
+                            Run {
+                                bold: false,
+                                italic: false,
+                                mono: true,
+                                pill: false,
+                                color: st.ink,
+                            },
+                        ));
+                    }
                     let indent = (st.base_px * 0.8) as u32;
+                    // Code must not word-wrap like prose. If the widest line
+                    // overflows the column, shrink this block's font (down to a
+                    // floor) so every line stays intact; only below the floor do
+                    // we let it wrap as a last resort.
+                    let avail = width
+                        .saturating_sub(indent)
+                        .saturating_sub((st.base_px * 0.3) as u32)
+                        as f32;
+                    let natural_w = self.measure_runs_width(&runs, st, Metrics::new(size, lh));
+                    let scale = if natural_w > avail && natural_w > 1.0 {
+                        (avail / natural_w).clamp(MIN_CODE_SCALE, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let (size, lh) = (size * scale, lh * scale);
                     let (buffer, height) = self.shape(
                         &runs,
                         st,
@@ -1361,7 +1584,22 @@ impl Painter {
                 Element::HorizontalRule { .. } => {
                     // A short centered rule with breathing room.
                     let lh = st.base_px;
-                    let (buffer, _) = self.shape(&[(String::new(), Run { bold: false, italic: false, mono: false, pill: false, color: st.ink })], st, Metrics::new(st.base_px, lh), width, Align::Left);
+                    let (buffer, _) = self.shape(
+                        &[(
+                            String::new(),
+                            Run {
+                                bold: false,
+                                italic: false,
+                                mono: false,
+                                pill: false,
+                                color: st.ink,
+                            },
+                        )],
+                        st,
+                        Metrics::new(st.base_px, lh),
+                        width,
+                        Align::Left,
+                    );
                     let rule_w = width / 4;
                     let rule_x = (width / 2 - rule_w / 2) as i32;
                     out.push(Block {
@@ -1380,13 +1618,27 @@ impl Painter {
                     });
                 }
 
-                Element::Table { headers, rows, aligns } => {
-                    if let Some((img, height)) = self.paint_table(headers, rows, aligns, st, width) {
+                Element::Table {
+                    headers,
+                    rows,
+                    aligns,
+                } => {
+                    if let Some((img, height)) = self.paint_table(headers, rows, aligns, st, width)
+                    {
                         // The table is pre-rasterized into its own bitmap (the
                         // block model is vertical-flow only); carry it as an
                         // Image decoration over an empty placeholder buffer.
                         let (buffer, _) = self.shape(
-                            &[(String::new(), Run { bold: false, italic: false, mono: false, pill: false, color: st.ink })],
+                            &[(
+                                String::new(),
+                                Run {
+                                    bold: false,
+                                    italic: false,
+                                    mono: false,
+                                    pill: false,
+                                    color: st.ink,
+                                },
+                            )],
                             st,
                             Metrics::new(st.base_px, st.base_px),
                             width,
@@ -1408,7 +1660,45 @@ impl Painter {
                     let img = super::chart_render::render_chart(chart, width, st);
                     let height = img.height();
                     let (buffer, _) = self.shape(
-                        &[(String::new(), Run { bold: false, italic: false, mono: false, pill: false, color: st.ink })],
+                        &[(
+                            String::new(),
+                            Run {
+                                bold: false,
+                                italic: false,
+                                mono: false,
+                                pill: false,
+                                color: st.ink,
+                            },
+                        )],
+                        st,
+                        Metrics::new(st.base_px, st.base_px),
+                        width,
+                        Align::Left,
+                    );
+                    out.push(Block {
+                        buffer,
+                        line_height: st.base_px,
+                        height,
+                        indent: base_indent,
+                        space_before: st.para_space(),
+                        decorations: vec![Decoration::Image { x: 0, y: 0, img }],
+                    });
+                }
+                Element::Mermaid { flowchart } => {
+                    // Same bitmap-as-decoration path as charts/tables.
+                    let img = super::mermaid_render::render_flowchart(flowchart, width, st);
+                    let height = img.height();
+                    let (buffer, _) = self.shape(
+                        &[(
+                            String::new(),
+                            Run {
+                                bold: false,
+                                italic: false,
+                                mono: false,
+                                pill: false,
+                                color: st.ink,
+                            },
+                        )],
                         st,
                         Metrics::new(st.base_px, st.base_px),
                         width,
@@ -1440,8 +1730,10 @@ impl Painter {
         buffer.set_size(Some(width as f32), None);
 
         let default = Attrs::new().family(Family::Name(st.body_font));
-        let spans: Vec<(&str, Attrs)> =
-            runs.iter().map(|(t, r)| (t.as_str(), r.attrs(st))).collect();
+        let spans: Vec<(&str, Attrs)> = runs
+            .iter()
+            .map(|(t, r)| (t.as_str(), r.attrs(st)))
+            .collect();
         buffer.set_rich_text(spans, &default, Shaping::Advanced, Some(align));
         buffer.shape_until_scroll(&mut self.font_system, false);
 
@@ -1455,13 +1747,47 @@ impl Painter {
         (buffer, bottom.ceil() as u32)
     }
 
+    /// Measure the widest visual line across styled runs without wrapping.
+    fn measure_runs_width(
+        &mut self,
+        runs: &[(String, Run)],
+        st: &DocStyle,
+        metrics: Metrics,
+    ) -> f32 {
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        buffer.set_size(Some(1.0e6), None);
+        let default = Attrs::new().family(Family::Name(st.body_font));
+        let spans: Vec<(&str, Attrs)> = runs
+            .iter()
+            .map(|(t, r)| (t.as_str(), r.attrs(st)))
+            .collect();
+        buffer.set_rich_text(spans, &default, Shaping::Advanced, Some(Align::Left));
+        buffer.shape_until_scroll(&mut self.font_system, false);
+
+        buffer
+            .layout_runs()
+            .map(|r| r.glyphs.iter().map(|g| g.x + g.w).fold(0.0_f32, f32::max))
+            .fold(0.0_f32, f32::max)
+    }
+
     /// Measure the pixel width of a single unwrapped run of text.
     fn measure_width(&mut self, text: &str, bold: bool, st: &DocStyle, size: f32) -> f32 {
-        let run = Run { bold, italic: false, mono: false, pill: false, color: st.ink };
+        let run = Run {
+            bold,
+            italic: false,
+            mono: false,
+            pill: false,
+            color: st.ink,
+        };
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size * 1.4));
         buffer.set_size(Some(1.0e6), None);
         let default = Attrs::new().family(Family::Name(st.body_font));
-        buffer.set_rich_text([(text, run.attrs(st))], &default, Shaping::Advanced, Some(Align::Left));
+        buffer.set_rich_text(
+            [(text, run.attrs(st))],
+            &default,
+            Shaping::Advanced,
+            Some(Align::Left),
+        );
         buffer.shape_until_scroll(&mut self.font_system, false);
         // Use glyph extents (right edge of the last glyph) rather than `line_w`,
         // whose value depends on the set buffer width and isn't the text advance.
@@ -1480,7 +1806,14 @@ impl Painter {
     }
 
     /// Rasterize a shaped buffer onto `img` at (ox, oy), alpha-blending glyphs.
-    fn blit_buffer(&mut self, img: &mut RgbaImage, buffer: &mut Buffer, ox: i32, oy: i32, ink: Color) {
+    fn blit_buffer(
+        &mut self,
+        img: &mut RgbaImage,
+        buffer: &mut Buffer,
+        ox: i32,
+        oy: i32,
+        ink: Color,
+    ) {
         let (iw, ih) = (img.width(), img.height());
         let (fs, sw) = (&mut self.font_system, &mut self.swash);
         buffer.draw(fs, sw, ink, |gx, gy, gw, gh, color| {
@@ -1525,9 +1858,7 @@ impl Painter {
         let lh = fs * 1.4;
         let pad_x = (st.base_px * 0.55).round();
         let pad_y = (st.base_px * 0.40).round();
-        let cell = |row: &[String], c: usize| -> String {
-            row.get(c).cloned().unwrap_or_default()
-        };
+        let cell = |row: &[String], c: usize| -> String { row.get(c).cloned().unwrap_or_default() };
 
         // 1. Per-column width bounds:
         //    - `natural` (max-content): widest single-line cell — what the column
@@ -1569,7 +1900,10 @@ impl Painter {
                     .map(|(n, m)| (n - m).max(0.0))
                     .sum();
                 if total_desire <= f32::EPSILON {
-                    min_content.iter().map(|m| (m.round() as u32).max(1)).collect()
+                    min_content
+                        .iter()
+                        .map(|m| (m.round() as u32).max(1))
+                        .collect()
                 } else {
                     natural
                         .iter()
@@ -1626,9 +1960,20 @@ impl Painter {
             for (c, cw) in col_w.iter().enumerate() {
                 let content_w = cw.saturating_sub(pad_x as u32 * 2).max(1);
                 let align = to_align(aligns.get(c).copied().unwrap_or(CellAlign::Left));
-                let run = Run { bold: *is_header, italic: false, mono: false, pill: false, color: st.ink };
-                let (buf, bh) =
-                    self.shape(&[(cell(cells, c), run)], st, Metrics::new(fs, lh), content_w, align);
+                let run = Run {
+                    bold: *is_header,
+                    italic: false,
+                    mono: false,
+                    pill: false,
+                    color: st.ink,
+                };
+                let (buf, bh) = self.shape(
+                    &[(cell(cells, c), run)],
+                    st,
+                    Metrics::new(fs, lh),
+                    content_w,
+                    align,
+                );
                 h = h.max(bh);
                 srow.push(buf);
             }
@@ -1653,7 +1998,8 @@ impl Painter {
         let total_h = yacc.max(1);
 
         // 4. Compose. Subtle header tint, then cells, then editorial rules.
-        let mut img = RgbaImage::from_pixel(table_w, total_h, Rgba([st.bg.0, st.bg.1, st.bg.2, 255]));
+        let mut img =
+            RgbaImage::from_pixel(table_w, total_h, Rgba([st.bg.0, st.bg.1, st.bg.2, 255]));
         fill_rect(&mut img, 0, 0, table_w, row_h[0], st.code_bg);
 
         let ink = Color::rgb(st.ink.0, st.ink.1, st.ink.2);
@@ -1670,11 +2016,26 @@ impl Painter {
         let light = (224u8, 224u8, 224u8);
         // Top, header separator, and bottom: stronger. Inter-row: light.
         fill_rect(&mut img, 0, 0, table_w, rule_h, strong);
-        fill_rect(&mut img, 0, row_h[0] as i32 - rule_h as i32, table_w, rule_h, strong);
-        for r in 2..row_y.len() {
-            fill_rect(&mut img, 0, row_y[r] as i32, table_w, rule_h.min(2).max(1), light);
+        fill_rect(
+            &mut img,
+            0,
+            row_h[0] as i32 - rule_h as i32,
+            table_w,
+            rule_h,
+            strong,
+        );
+        let light_rule_h = rule_h.clamp(1, 2);
+        for y in row_y.iter().skip(2) {
+            fill_rect(&mut img, 0, *y as i32, table_w, light_rule_h, light);
         }
-        fill_rect(&mut img, 0, total_h as i32 - rule_h as i32, table_w, rule_h, strong);
+        fill_rect(
+            &mut img,
+            0,
+            total_h as i32 - rule_h as i32,
+            table_w,
+            rule_h,
+            strong,
+        );
 
         Some((img, total_h))
     }
@@ -1704,7 +2065,11 @@ impl Painter {
             let (iw, ih) = decoded.dimensions();
             if iw > 0 && ih > 0 {
                 // Fit to the measure; never upscale beyond natural size.
-                let scale = if iw > width { width as f32 / iw as f32 } else { 1.0 };
+                let scale = if iw > width {
+                    width as f32 / iw as f32
+                } else {
+                    1.0
+                };
                 let tw = ((iw as f32 * scale).round() as u32).max(1);
                 let th = ((ih as f32 * scale).round() as u32).max(1);
                 let scaled = if (scale - 1.0).abs() < f32::EPSILON {
@@ -1723,7 +2088,13 @@ impl Painter {
     fn image_placeholder(&mut self, alt: &str, st: &DocStyle, width: u32) -> (RgbaImage, u32) {
         let pad = (st.base_px * 0.8) as u32;
         let caption = if alt.trim().is_empty() { "image" } else { alt };
-        let cap_run = Run { bold: false, italic: true, mono: false, pill: false, color: st.code };
+        let cap_run = Run {
+            bold: false,
+            italic: true,
+            mono: false,
+            pill: false,
+            color: st.code,
+        };
         let (mut cbuf, ch) = self.shape(
             &[(caption.to_string(), cap_run)],
             st,
@@ -1732,8 +2103,11 @@ impl Painter {
             Align::Center,
         );
         let h = ch + pad * 2;
-        let mut img =
-            RgbaImage::from_pixel(width, h, Rgba([st.code_bg.0, st.code_bg.1, st.code_bg.2, 255]));
+        let mut img = RgbaImage::from_pixel(
+            width,
+            h,
+            Rgba([st.code_bg.0, st.code_bg.1, st.code_bg.2, 255]),
+        );
         // Border.
         let b = (st.base_px * 0.05).max(2.0) as u32;
         fill_rect(&mut img, 0, 0, width, b, st.chrome);
@@ -1762,7 +2136,9 @@ fn blend_pixel(img: &mut RgbaImage, x: u32, y: u32, rgb: Rgb, a: u8) {
     let dst = img.get_pixel_mut(x, y);
     let af = a as f32 / 255.0;
     let blend = |s: u8, d: u8| -> u8 {
-        (s as f32 * af + d as f32 * (1.0 - af)).round().clamp(0.0, 255.0) as u8
+        (s as f32 * af + d as f32 * (1.0 - af))
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
     dst[0] = blend(rgb.0, dst[0]);
     dst[1] = blend(rgb.1, dst[1]);
@@ -1785,7 +2161,15 @@ fn blit_image(dst: &mut RgbaImage, src: &RgbaImage, x: i32, y: i32) {
 }
 
 /// Draw a thick line by stamping square dabs along it. Crude but crisp at 2x.
-fn draw_thick_line(img: &mut RgbaImage, x0: f32, y0: f32, x1: f32, y1: f32, thick: f32, color: Rgb) {
+fn draw_thick_line(
+    img: &mut RgbaImage,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    thick: f32,
+    color: Rgb,
+) {
     let len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
     let steps = (len.ceil() as i32 * 2).max(1);
     let t = thick.max(1.0);
@@ -1809,8 +2193,24 @@ fn make_checkbox(checked: bool, size: u32, st: &DocStyle) -> RgbaImage {
         fill_rect(&mut img, 0, 0, s, s, st.accent);
         let sf = s as f32;
         let t = (sf * 0.13).max(2.0);
-        draw_thick_line(&mut img, sf * 0.24, sf * 0.54, sf * 0.43, sf * 0.72, t, st.bg);
-        draw_thick_line(&mut img, sf * 0.43, sf * 0.72, sf * 0.78, sf * 0.30, t, st.bg);
+        draw_thick_line(
+            &mut img,
+            sf * 0.24,
+            sf * 0.54,
+            sf * 0.43,
+            sf * 0.72,
+            t,
+            st.bg,
+        );
+        draw_thick_line(
+            &mut img,
+            sf * 0.43,
+            sf * 0.72,
+            sf * 0.78,
+            sf * 0.30,
+            t,
+            st.bg,
+        );
     } else {
         // Hollow outlined square.
         fill_rect(&mut img, 0, 0, s, stroke, st.accent);

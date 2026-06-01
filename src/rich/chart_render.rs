@@ -12,15 +12,15 @@ use image::{Rgba, RgbaImage};
 use plotters::prelude::*;
 use plotters::style::{FontStyle, RGBColor};
 
-use crate::chart::{Chart, ChartKind, fmt_num};
 use super::paint::{DocStyle, Rgb};
+use crate::chart::{Chart, ChartKind, fmt_num};
 
 /// plotters' pure-Rust `ab_glyph` backend ships no default font, so we register
 /// one ourselves (once). We reuse a real `.ttf` the system already has — the
 /// rich reader already depends on these on macOS — and fall back across
 /// platforms. Without this, every text draw fails with `FontUnavailable` and
 /// the whole chart comes out blank.
-fn ensure_font() -> bool {
+pub(crate) fn ensure_font() -> bool {
     static REGISTERED: OnceLock<bool> = OnceLock::new();
     *REGISTERED.get_or_init(|| {
         const CANDIDATES: &[&str] = &[
@@ -50,12 +50,12 @@ fn ensure_font() -> bool {
 
 /// Series palette (cycled). Distinct, readable hues that work on a light page.
 const PALETTE: [Rgb; 6] = [
-    (26, 95, 180),   // blue
-    (200, 80, 60),   // red
-    (40, 140, 90),   // green
-    (180, 130, 30),  // amber
-    (120, 70, 170),  // purple
-    (60, 150, 170),  // teal
+    (26, 95, 180),  // blue
+    (200, 80, 60),  // red
+    (40, 140, 90),  // green
+    (180, 130, 30), // amber
+    (120, 70, 170), // purple
+    (60, 150, 170), // teal
 ];
 
 fn color(rgb: Rgb) -> RGBColor {
@@ -241,18 +241,29 @@ where
         .iter()
         .map(|(k, v)| format!("{k} ({})", fmt_num(*v)))
         .collect();
-    let colors: Vec<RGBColor> =
-        (0..chart.data.len()).map(|i| color(PALETTE[i % PALETTE.len()])).collect();
+    let colors: Vec<RGBColor> = (0..chart.data.len())
+        .map(|i| color(PALETTE[i % PALETTE.len()]))
+        .collect();
 
     let mut pie = Pie::new(&center, &radius, &sizes, &colors, &labels);
     pie.start_angle(-90.0);
-    pie.label_style(("sans-serif", (st.base_px * 0.55) as i32).into_font().color(&ink));
+    pie.label_style(
+        ("sans-serif", (st.base_px * 0.55) as i32)
+            .into_font()
+            .color(&ink),
+    );
     root.draw(&pie)?;
     Ok(())
 }
 
 fn longest_series(chart: &Chart) -> usize {
-    chart.series.iter().map(|s| s.y.len()).max().unwrap_or(0).max(1)
+    chart
+        .series
+        .iter()
+        .map(|s| s.y.len())
+        .max()
+        .unwrap_or(0)
+        .max(1)
 }
 
 fn scatter_ranges(chart: &Chart) -> (std::ops::Range<f64>, std::ops::Range<f64>) {

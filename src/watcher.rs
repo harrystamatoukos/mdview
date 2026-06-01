@@ -1,17 +1,19 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
     style::Style,
     text::{Line, Text},
     widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
-    Frame, Terminal,
 };
 use std::io::stdout;
 use std::path::Path;
@@ -57,7 +59,8 @@ impl WatchPager {
     fn update_content(&mut self, content: Text<'static>, viewport_height: usize) {
         self.total_lines = content.lines.len();
         self.content = content;
-        self.view.clamp_to_content(self.total_lines, viewport_height);
+        self.view
+            .clamp_to_content(self.total_lines, viewport_height);
         self.last_refresh = Instant::now();
         self.show_refresh_indicator = true;
     }
@@ -67,7 +70,8 @@ impl WatchPager {
     }
 
     fn scroll_down(&mut self, amount: usize, viewport_height: usize) {
-        self.view.scroll_down(amount, self.total_lines, viewport_height);
+        self.view
+            .scroll_down(amount, self.total_lines, viewport_height);
     }
 
     fn scroll_to_top(&mut self) {
@@ -75,7 +79,8 @@ impl WatchPager {
     }
 
     fn scroll_to_bottom(&mut self, viewport_height: usize) {
-        self.view.scroll_to_bottom(self.total_lines, viewport_height);
+        self.view
+            .scroll_to_bottom(self.total_lines, viewport_height);
     }
 
     /// Update animation state, returns true if still animating
@@ -125,7 +130,11 @@ pub fn watch_and_display(path: &Path, theme: Theme) -> Result<()> {
     let result = run_watch_loop(&mut terminal, &mut pager, &rx, path);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
 
     result
 }
@@ -148,7 +157,8 @@ fn run_watch_loop(
             while file_rx.try_recv().is_ok() {}
 
             if let Ok(content) = std::fs::read_to_string(path) {
-                let text = renderer::render_to_text(&content, width.saturating_sub(4), &pager.theme);
+                let text =
+                    renderer::render_to_text(&content, width.saturating_sub(4), &pager.theme);
                 pager.update_content(text, viewport_height);
                 dirty = true;
             }
@@ -240,7 +250,8 @@ fn handle_watch_event(
             }
             KeyCode::Char('r') => {
                 if let Ok(content) = std::fs::read_to_string(path) {
-                    let text = renderer::render_to_text(&content, width.saturating_sub(4), &pager.theme);
+                    let text =
+                        renderer::render_to_text(&content, width.saturating_sub(4), &pager.theme);
                     pager.update_content(text, viewport_height);
                     WatchEvent::Changed
                 } else {
@@ -285,7 +296,12 @@ fn draw_watch(frame: &mut Frame, pager: &WatchPager, viewport_height: usize, pat
     let total = pager.content.lines.len();
     let start = scroll_pos.min(total);
     let end = (scroll_pos + content_area.height as usize).min(total);
-    render_visible_lines(frame, &pager.content.lines[start..end], content_area, pager.theme.canvas());
+    render_visible_lines(
+        frame,
+        &pager.content.lines[start..end],
+        content_area,
+        pager.theme.canvas(),
+    );
 
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(Some("↑"))

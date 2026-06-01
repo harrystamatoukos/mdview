@@ -83,9 +83,9 @@ pub const TABLE_LABEL_MAX_WIDTH: usize = 15;
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum ThemeType {
     #[default]
-    Paper,  // Warm, book-like (best for reading)
-    Dark,   // Dark mode with warm undertones
-    Light,  // Clean but not harsh
+    Paper, // Warm, book-like (best for reading)
+    Dark,  // Dark mode with warm undertones
+    Light, // Clean but not harsh
 }
 
 pub struct Theme {
@@ -212,28 +212,40 @@ impl Theme {
     // ─────────────────────────────────────────────────────────────
 
     pub fn h1(&self) -> Style {
-        Style::default().fg(self.palette().h1).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.palette().h1)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn h2(&self) -> Style {
-        Style::default().fg(self.palette().h2).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.palette().h2)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn h3(&self) -> Style {
-        Style::default().fg(self.palette().h3).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.palette().h3)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn h4(&self) -> Style {
-        Style::default().fg(self.palette().h4).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.palette().h4)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn h5(&self) -> Style {
-        Style::default().fg(self.palette().h5).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.palette().h5)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn h6(&self) -> Style {
         // Same hue as H5 but dimmed - the quietest heading
-        Style::default().fg(self.palette().h6).add_modifier(Modifier::DIM)
+        Style::default()
+            .fg(self.palette().h6)
+            .add_modifier(Modifier::DIM)
     }
 
     /// Left accent bar shown before H1 titles
@@ -270,6 +282,25 @@ impl Theme {
         Style::default().fg(self.palette().code)
     }
 
+    /// Color for one syntax-highlighted code token. Reuses the active palette so
+    /// highlighting stays within the theme (warm on paper, bright on dark) and
+    /// adds no new color constants.
+    pub fn code_token(&self, kind: crate::highlight::TokenKind) -> Style {
+        use crate::highlight::TokenKind::*;
+        let p = self.palette();
+        let color = match kind {
+            Plain | Punct => p.code,
+            Comment => p.chrome,
+            Keyword => p.accent,
+            Type => p.h3,
+            Builtin => p.h4,
+            Str => p.link,
+            Number => p.h4,
+            Function => p.h2,
+        };
+        Style::default().fg(color)
+    }
+
     pub fn code_border(&self) -> Style {
         Style::default()
             .fg(self.chrome_color())
@@ -292,8 +323,7 @@ impl Theme {
 
     pub fn list_marker(&self) -> Style {
         // Warm accent - bullets and numbers carry a touch of color
-        Style::default()
-            .fg(self.accent_color())
+        Style::default().fg(self.accent_color())
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -312,8 +342,7 @@ impl Theme {
 
     pub fn hr(&self) -> Style {
         // Warm accent rule - a clear but graceful section break
-        Style::default()
-            .fg(self.accent_color())
+        Style::default().fg(self.accent_color())
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -322,7 +351,9 @@ impl Theme {
 
     pub fn table_header(&self) -> Style {
         // Match h1
-        Style::default().fg(self.palette().h1).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.palette().h1)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn table_border(&self) -> Style {
@@ -353,8 +384,7 @@ impl Theme {
     pub fn cursor(&self) -> Style {
         // Reversed colors make the cursor position unmistakable.
         // On the painted page this becomes an ink block on paper.
-        Style::default()
-            .add_modifier(Modifier::REVERSED)
+        Style::default().add_modifier(Modifier::REVERSED)
     }
 
     pub fn strikethrough(&self) -> Style {

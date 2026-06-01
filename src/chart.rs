@@ -53,12 +53,26 @@ impl Chart {
     pub fn parse(yaml: &str) -> Option<Chart> {
         let raw: Raw = serde_yaml_ng::from_str(yaml).ok()?;
 
-        let x = raw.x.unwrap_or_default().iter().map(Scalar::label).collect();
+        let x = raw
+            .x
+            .unwrap_or_default()
+            .iter()
+            .map(Scalar::label)
+            .collect();
 
         let series = if let Some(series) = raw.series {
-            series.into_iter().map(|s| Series { name: s.name, y: s.y }).collect()
+            series
+                .into_iter()
+                .map(|s| Series {
+                    name: s.name,
+                    y: s.y,
+                })
+                .collect()
         } else if let Some(y) = raw.y {
-            vec![Series { name: String::new(), y }]
+            vec![Series {
+                name: String::new(),
+                y,
+            }]
         } else {
             Vec::new()
         };
@@ -178,7 +192,8 @@ mod tests {
 
     #[test]
     fn parses_multi_series() {
-        let y = "type: line\nx: [1,2]\nseries:\n  - name: A\n    y: [1,2]\n  - name: B\n    y: [3,4]";
+        let y =
+            "type: line\nx: [1,2]\nseries:\n  - name: A\n    y: [1,2]\n  - name: B\n    y: [3,4]";
         let c = Chart::parse(y).unwrap();
         assert_eq!(c.series.len(), 2);
         assert_eq!(c.series[1].name, "B");
@@ -187,7 +202,10 @@ mod tests {
     #[test]
     fn parses_pie_in_order() {
         let c = Chart::parse("type: pie\ndata:\n  A: 40\n  B: 25\n  C: 35").unwrap();
-        assert_eq!(c.data, vec![("A".into(), 40.0), ("B".into(), 25.0), ("C".into(), 35.0)]);
+        assert_eq!(
+            c.data,
+            vec![("A".into(), 40.0), ("B".into(), 25.0), ("C".into(), 35.0)]
+        );
     }
 
     #[test]

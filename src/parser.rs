@@ -4,9 +4,7 @@
 //! were removed with the editor path because read mode never maps screen
 //! positions back to markdown bytes.
 
-use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
-};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::chart::Chart;
 
@@ -27,11 +25,20 @@ pub enum Element {
     },
     CodeBlock {
         code: String,
+        /// First word of the fence info string (e.g. `rust`, `python`). Empty
+        /// for indented blocks or bare fences. Drives syntax highlighting and
+        /// the language label.
+        lang: String,
     },
     /// A ` ```chart ` block whose YAML parsed into a valid chart spec. Malformed
     /// chart blocks stay `CodeBlock` so they degrade to legible YAML.
     Chart {
         chart: Chart,
+    },
+    /// A ` ```mermaid ` block whose body parsed as a supported flowchart.
+    /// Unsupported/malformed mermaid stays a `CodeBlock` (shows the source).
+    Mermaid {
+        flowchart: crate::mermaid::Flowchart,
     },
     BlockQuote {
         elements: Vec<Element>,
@@ -47,7 +54,7 @@ pub enum Element {
         rows: Vec<Vec<String>>,
         /// Per-column horizontal alignment (defaults to Left when unspecified).
         aligns: Vec<CellAlign>,
-    }
+    },
 }
 
 /// Per-column table alignment.
@@ -90,12 +97,21 @@ pub enum SpanKind {
     Strong(String),
     StrongEmphasis(String),
     Code(String),
-    Link { text: String, url: String },
-    Image { url: String, alt: String },
+    Link {
+        text: String,
+        url: String,
+    },
+    Image {
+        url: String,
+        alt: String,
+    },
     Strikethrough(String),
     /// A footnote reference. `number` is resolved after parsing (order of first
     /// reference); `label` is the source identifier used to dedupe references.
-    FootnoteRef { label: String, number: usize },
+    FootnoteRef {
+        label: String,
+        number: usize,
+    },
     SoftBreak,
     HardBreak,
 }
@@ -251,7 +267,9 @@ fn resolve_footnotes(elements: &mut Vec<Element>, defs: Vec<(String, Vec<Element
         // Prefix the first paragraph with "n. "; keep any further blocks as-is.
         let mut blocks = inner.into_iter();
         let first = blocks.next();
-        let mut spans = vec![Span { kind: SpanKind::Text(format!("{n}. ")) }];
+        let mut spans = vec![Span {
+            kind: SpanKind::Text(format!("{n}. ")),
+        }];
         let mut trailing: Vec<Element> = Vec::new();
         match first {
             Some(Element::Paragraph { spans: ps }) => spans.extend(ps),
@@ -264,10 +282,7 @@ fn resolve_footnotes(elements: &mut Vec<Element>, defs: Vec<(String, Vec<Element
     }
 }
 
-fn parse_event<'a, I>(
-    event: Event<'a>,
-    iter: &mut std::iter::Peekable<I>,
-) -> Option<Element>
+fn parse_event<'a, I>(event: Event<'a>, iter: &mut std::iter::Peekable<I>) -> Option<Element>
 where
     I: Iterator<Item = Event<'a>>,
 {
@@ -301,7 +316,15 @@ where
             {
                 return Some(Element::Chart { chart });
             }
-            Some(Element::CodeBlock { code })
+            // A mermaid flowchart we can parse renders natively; anything else
+            // (other mermaid diagram types, malformed input) falls through to a
+            // code block showing the source.
+            if lang == "mermaid"
+                && let Some(flowchart) = crate::mermaid::parse(&code)
+            {
+                return Some(Element::Mermaid { flowchart });
+            }
+            Some(Element::CodeBlock { code, lang })
         }
         Event::Start(Tag::BlockQuote(_)) => {
             let mut inner_elements = Vec::new();
@@ -363,10 +386,7 @@ fn heading_level_to_u8(level: HeadingLevel) -> u8 {
 }
 
 /// Collect text until end tag.
-fn collect_text_until_end<'a, I>(
-    iter: &mut I,
-    end_tag: TagEnd,
-) -> String
+fn collect_text_until_end<'a, I>(iter: &mut I, end_tag: TagEnd) -> String
 where
     I: Iterator<Item = Event<'a>>,
 {
@@ -394,7 +414,9 @@ fn spans_to_text(spans: &[Span]) -> String {
             | SpanKind::StrongEmphasis(t)
             | SpanKind::Code(t)
             | SpanKind::Strikethrough(t) => text.push_str(t),
-            SpanKind::Link { text: link_text, .. } => text.push_str(link_text),
+            SpanKind::Link {
+                text: link_text, ..
+            } => text.push_str(link_text),
             SpanKind::Image { alt, .. } => text.push_str(alt),
             SpanKind::FootnoteRef { number, .. } => text.push_str(&superscript(*number)),
             SpanKind::SoftBreak | SpanKind::HardBreak => text.push(' '),
@@ -413,10 +435,7 @@ pub fn superscript(n: usize) -> String {
 }
 
 /// Collect spans until end tag.
-fn collect_spans_until_end<'a, I>(
-    iter: &mut std::iter::Peekable<I>,
-    end_tag: TagEnd,
-) -> Vec<Span>
+fn collect_spans_until_end<'a, I>(iter: &mut std::iter::Peekable<I>, end_tag: TagEnd) -> Vec<Span>
 where
     I: Iterator<Item = Event<'a>>,
 {
@@ -429,10 +448,14 @@ where
             Some(Event::Text(t)) => {
                 // Use into_string() to avoid allocation when CowStr is already owned
                 let text = t.into_string();
-                spans.push(Span { kind: styled_text_kind(text, style_flags) });
+                spans.push(Span {
+                    kind: styled_text_kind(text, style_flags),
+                });
             }
             Some(Event::Code(t)) => {
-                spans.push(Span { kind: SpanKind::Code(t.into_string()) });
+                spans.push(Span {
+                    kind: SpanKind::Code(t.into_string()),
+                });
             }
             Some(Event::Start(Tag::Emphasis)) => style_flags |= EMPHASIS,
             Some(Event::End(TagEnd::Emphasis)) => style_flags &= !EMPHASIS,
@@ -451,25 +474,39 @@ where
             }
             Some(Event::FootnoteReference(label)) => {
                 spans.push(Span {
-                    kind: SpanKind::FootnoteRef { label: label.into_string(), number: 0 },
+                    kind: SpanKind::FootnoteRef {
+                        label: label.into_string(),
+                        number: 0,
+                    },
                 });
             }
             Some(Event::Start(Tag::Image { dest_url, .. })) => {
                 let alt = collect_image_alt(iter);
                 spans.push(Span {
-                    kind: SpanKind::Image { url: dest_url.into_string(), alt },
+                    kind: SpanKind::Image {
+                        url: dest_url.into_string(),
+                        alt,
+                    },
                 });
             }
             Some(Event::InlineHtml(t)) => {
                 if let Some((flag, open)) = html_style_toggle(&t) {
-                    if open { style_flags |= flag } else { style_flags &= !flag }
+                    if open {
+                        style_flags |= flag
+                    } else {
+                        style_flags &= !flag
+                    }
                 }
             }
             Some(Event::SoftBreak) => {
-                spans.push(Span { kind: SpanKind::SoftBreak });
+                spans.push(Span {
+                    kind: SpanKind::SoftBreak,
+                });
             }
             Some(Event::HardBreak) => {
-                spans.push(Span { kind: SpanKind::HardBreak });
+                spans.push(Span {
+                    kind: SpanKind::HardBreak,
+                });
             }
             None => break,
             _ => {}
@@ -512,9 +549,7 @@ where
     text
 }
 
-fn collect_list_items<'a, I>(
-    iter: &mut std::iter::Peekable<I>,
-) -> Vec<ListItem>
+fn collect_list_items<'a, I>(iter: &mut std::iter::Peekable<I>) -> Vec<ListItem>
 where
     I: Iterator<Item = Event<'a>>,
 {
@@ -537,25 +572,39 @@ where
                         Some(Event::TaskListMarker(checked)) => task = Some(checked),
                         Some(Event::Text(t)) if blocks.is_empty() => {
                             let text = t.into_string();
-                            spans.push(Span { kind: styled_text_kind(text, style_flags) });
+                            spans.push(Span {
+                                kind: styled_text_kind(text, style_flags),
+                            });
                         }
                         Some(Event::Code(t)) if blocks.is_empty() => {
-                            spans.push(Span { kind: SpanKind::Code(t.into_string()) });
+                            spans.push(Span {
+                                kind: SpanKind::Code(t.into_string()),
+                            });
                         }
                         Some(Event::FootnoteReference(label)) if blocks.is_empty() => {
                             spans.push(Span {
-                                kind: SpanKind::FootnoteRef { label: label.into_string(), number: 0 },
+                                kind: SpanKind::FootnoteRef {
+                                    label: label.into_string(),
+                                    number: 0,
+                                },
                             });
                         }
                         Some(Event::Start(Tag::Image { dest_url, .. })) if blocks.is_empty() => {
                             let alt = collect_image_alt(iter);
                             spans.push(Span {
-                                kind: SpanKind::Image { url: dest_url.into_string(), alt },
+                                kind: SpanKind::Image {
+                                    url: dest_url.into_string(),
+                                    alt,
+                                },
                             });
                         }
                         Some(Event::InlineHtml(t)) if blocks.is_empty() => {
                             if let Some((flag, open)) = html_style_toggle(&t) {
-                                if open { style_flags |= flag } else { style_flags &= !flag }
+                                if open {
+                                    style_flags |= flag
+                                } else {
+                                    style_flags &= !flag
+                                }
                             }
                         }
                         Some(Event::Start(Tag::Emphasis)) => style_flags |= EMPHASIS,
@@ -574,7 +623,9 @@ where
                             }
                         }
                         Some(Event::SoftBreak) if blocks.is_empty() => {
-                            spans.push(Span { kind: SpanKind::SoftBreak });
+                            spans.push(Span {
+                                kind: SpanKind::SoftBreak,
+                            });
                         }
                         // Any other block element (code block, blockquote,
                         // nested list, heading, rule, table) is parsed as a
@@ -588,7 +639,11 @@ where
                     }
                 }
 
-                items.push(ListItem { spans, blocks, task });
+                items.push(ListItem {
+                    spans,
+                    blocks,
+                    task,
+                });
             }
             Some(Event::End(TagEnd::List(_))) => break,
             None => break,
@@ -703,9 +758,21 @@ mod tests {
     fn test_parse_paragraph_inline() {
         match &parse("normal *em* **strong** `code`")[0] {
             Element::Paragraph { spans, .. } => {
-                assert!(spans.iter().any(|s| matches!(&s.kind, SpanKind::Emphasis(t) if t == "em")));
-                assert!(spans.iter().any(|s| matches!(&s.kind, SpanKind::Strong(t) if t == "strong")));
-                assert!(spans.iter().any(|s| matches!(&s.kind, SpanKind::Code(t) if t == "code")));
+                assert!(
+                    spans
+                        .iter()
+                        .any(|s| matches!(&s.kind, SpanKind::Emphasis(t) if t == "em"))
+                );
+                assert!(
+                    spans
+                        .iter()
+                        .any(|s| matches!(&s.kind, SpanKind::Strong(t) if t == "strong"))
+                );
+                assert!(
+                    spans
+                        .iter()
+                        .any(|s| matches!(&s.kind, SpanKind::Code(t) if t == "code"))
+                );
             }
             other => panic!("expected paragraph, got {other:?}"),
         }
@@ -746,7 +813,12 @@ mod tests {
     #[test]
     fn test_parse_ordered_list() {
         match &parse("1. one\n2. two")[0] {
-            Element::List { ordered, start, items, .. } => {
+            Element::List {
+                ordered,
+                start,
+                items,
+                ..
+            } => {
                 assert!(ordered);
                 assert_eq!(*start, Some(1));
                 assert_eq!(items.len(), 2);
@@ -764,5 +836,4 @@ mod tests {
     fn test_parse_horizontal_rule() {
         assert!(matches!(&parse("---")[0], Element::HorizontalRule { .. }));
     }
-
 }

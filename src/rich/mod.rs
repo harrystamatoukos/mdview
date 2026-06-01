@@ -8,6 +8,7 @@
 
 mod chart_render;
 mod clipboard;
+mod mermaid_render;
 mod overlay;
 mod paint;
 mod view;
